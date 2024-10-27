@@ -1,4 +1,4 @@
-This implements dynamic ahead of time compilation by piping c source code to a compiler and linking against the shared object. Works with all major compilers including: [tcc](https://bellard.org/tcc/), gcc, clang.
+This facilitates dynamic ahead of time compilation by piping c source code to a compiler and linking against the shared object. Works with all major compilers including: [tcc](https://bellard.org/tcc/), gcc, clang.
 
 Alternatives to this lib exist:
 
@@ -16,11 +16,16 @@ This is [not a new idea](https://forums.raspberrypi.com/viewtopic.php?t=319919#p
 
 Here's a test case and example:
 
+```bash
+cc main.c -DCOMPILER_USED=gcc -D_GNU_SOURCE
+```
+
 ```c
+// main.c
 #include <assert.h>
 #include <string.h>
 
-#include "compiler/c_aot_compile.h"
+#include "c_aot_compile.h"
 
 #ifndef COMPILER_USED
     // for example, in a makefile add: -DCOMPILER_USED=$(CC)
@@ -68,6 +73,7 @@ int add(int a, int b) {return a + b;}";
         }
         return 1;
     }
+    puts("Ok!");
     return 0;
 }
 ```

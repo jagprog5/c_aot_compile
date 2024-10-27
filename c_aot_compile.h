@@ -1,5 +1,4 @@
 #pragma once
-#define _GNU_SOURCE
 
 /**
  * ahead of time compilation using c compiler. c source is compiled, then loaded
@@ -67,24 +66,24 @@ void* c_aot_compile(const char* c_compiler, const char* program_begin, const cha
     // child process
     if (dup2(stdin_pipe[0], STDIN_FILENO) == -1 || //
                  dup2(stderr_pipe[1], STDERR_FILENO) == -1) {
-      perror("dup2");
+      perror("dup2 failed before compiler started");
       exit(EXIT_FAILURE); // in child process - exit now
     }
 
     int dev_null = open("/dev/null", O_WRONLY);
     if (dev_null == -1) {
-      perror("open");
+      perror("open failed before compiler started");
       exit(EXIT_FAILURE); // in child process - exit now
     }
     if (dup2(dev_null, STDOUT_FILENO) == -1) {
-      perror("dup2");
+      perror("dup2 failed before compiler started");
       exit(EXIT_FAILURE); // in child process - exit now
     }
 
     if (close(stdin_pipe[1]) == -1) {
       // must close stdin writer or else it will keep child process alive
       // as it waits for input
-      perror("close");
+      perror("close failed before compiler started");
       exit(EXIT_FAILURE); // in child process - exit now
     }
 
@@ -93,7 +92,7 @@ void* c_aot_compile(const char* c_compiler, const char* program_begin, const cha
       int printf_result = snprintf(compile_output_file_arg, //
                                    sizeof(compile_output_file_arg), "-o%s", compile_output_file);
       if (printf_result < 0 || (unsigned long)printf_result >= sizeof(compile_output_file_arg)) {
-        fputs("format error", stderr);
+        fputs("format error before compiler started", stderr);
         exit(EXIT_FAILURE); // in child process - exit now
       }
     }
@@ -178,8 +177,30 @@ void* c_aot_compile(const char* c_compiler, const char* program_begin, const cha
 
     args[sizeof(args) / sizeof(*args) - 1] = (char*)NULL; // execl args are null terminating
 
-    execvp(c_compiler, args);
-    perror("execl");    // only reached on error
+    // pass ENV vars. append TMPDIR so gcc, clang won't use disk for temp files
+    size_t env_count = 0;
+    extern char **environ;
+    while (environ[env_count] != 0) {
+        ++env_count;
+    }
+    env_count += 2; // +1 for new var, +1 for NULL
+
+    char* env[env_count];
+
+    for (size_t i = 0; i < env_count - 2; ++i) {
+      env[i] = environ[i];
+    }
+
+    // copy required since env non const
+    const char* env_to_add_const = "TMPDIR=/dev/shm";
+    size_t env_to_add_size = strlen(env_to_add_const) + 1;
+    char env_to_add[env_to_add_size];
+    memcpy(env_to_add, env_to_add_const, env_to_add_size);
+
+    env[env_count - 2] = env_to_add; // place it last (highest precedence)
+    env[env_count - 1] = (char*)NULL; // env null terminating
+    execvpe(c_compiler, args, env);
+    perror("execl failed before compiler started");    // only reached on error
     exit(EXIT_FAILURE); // in child process - exit now
     // all other fds will be closed by OS on child process exit.
     // this is required by the code_pipe (can't be closed before execl)
@@ -216,6 +237,46 @@ void* c_aot_compile(const char* c_compiler, const char* program_begin, const cha
   }
 
   {
+    // the compiler might be producing stderr.
+    // something must be reading it, or else the stderr write will block if the compiler's error is very large.
+    
+    // reading will always occur, but only if there is a failure exit status then it will be displayed.
+    // only n bytes will be read, and the reset is discarded (constant space)
+    const size_t COMPILER_STDERR_BUF_CAPACITY = 500;
+    size_t compiler_stderr_size = 0;
+    char compiler_stderr_buf[COMPILER_STDERR_BUF_CAPACITY];
+
+    bool compiler_stderr_was_truncated = false;
+
+    while (compiler_stderr_size != COMPILER_STDERR_BUF_CAPACITY) {
+      size_t read_ret = read(stderr_pipe[0], compiler_stderr_buf + compiler_stderr_size, COMPILER_STDERR_BUF_CAPACITY - compiler_stderr_size);
+      if (read_ret < 0) {
+        perror("reading compiler's stderr");
+        goto end;
+      }
+      if (read_ret == 0) {
+        goto after_discard_compiler_stderr;
+      }
+      compiler_stderr_size += read_ret;
+    }
+
+    // the stderr buffer is full, discard any remaining
+    while (1) {
+      char discard[1024];
+      size_t read_ret = read(stderr_pipe[0], discard, sizeof(discard) / sizeof(char));
+      if (read_ret < 0) {
+        perror("reading compiler's stderr");
+        goto end;
+      }
+      if (read_ret == 0) {
+        break;
+      }
+      // if this point is reached, then some amount of bytes has been discarded
+      compiler_stderr_was_truncated = true;
+    }
+
+    after_discard_compiler_stderr:
+
     int child_return_status;
     if (waitpid(pid, &child_return_status, 0) == -1) {
       perror("waitpid");
@@ -227,25 +288,10 @@ void* c_aot_compile(const char* c_compiler, const char* program_begin, const cha
     }
 
     if (child_return_status != 0) {
-      fprintf(stderr, "child process containing %s exited with code %d, stderr:\n", c_compiler, child_return_status);
-      char buffer[1024];
-      ssize_t count;
-      size_t while_loop_limit = 1000; // make bounded in time for safety
-      while (1) {
-        if (while_loop_limit == 0) {
-          fputs("\n... stderr was truncated\n", stderr);
-          break;
-        }
-        --while_loop_limit;
-        count = read(stderr_pipe[0], buffer, sizeof(buffer));
-        if (count < 0) {
-          perror("read");
-          goto end;
-        }
-        if (count == 0) {
-          break;
-        }
-        fwrite(buffer, sizeof(char), count, stderr);
+      fprintf(stderr, "child process started for compiler \"%s\" exited with code %d. stderr:\n", c_compiler, child_return_status);
+      fwrite(compiler_stderr_buf, sizeof(char), compiler_stderr_size, stderr);
+      if (compiler_stderr_was_truncated) {
+        fprintf(stderr, "\n... stderr from \"%s\" was truncated\n", c_compiler);
       }
       goto end;
     }
