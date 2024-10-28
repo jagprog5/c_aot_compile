@@ -13,35 +13,219 @@
 #include <sys/mman.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <errno.h>
+#include <string.h>
+#include <stdarg.h>
 
-// returns NULL on error - an appropriate error will have been printed to stderr
-// returns the dlopen handle for the compiled shared object.
+// ================================= error handling =====================================
+
+// this is a super basic and dead simple string manipulation lib, for use by the aot lib's error messages
+
+// malloc formatted string
+static char* c_aot_err_printf_owned(const char* format, ...) {
+  va_list args;
+  va_start(args, format);
+  int size = vsnprintf(NULL, 0, format, args);
+  va_end(args);
+
+  if (size < 0) {
+    return NULL;
+  }
+  size += 1; // for null char
+  char* ret = malloc(size * sizeof(char));
+  if (!ret) {
+    return NULL;
+  }
+
+  va_start(args, format);
+  vsnprintf(ret, size, format, args);
+  va_end(args);
+
+  return ret;
+}
+
+// concatenate two strings.
+// args:
+// - are owned (malloc)
+// - can be NULL (treated as empty)
+// - will be freed by this function  
 //
+// return value:
+// - can be NULL
+// - is owned (malloc)
+static char* c_aot_err_strcat(char* first, char* second) {
+  const char* first_used = first ? first : "";
+  const char* second_used = second ? second : "";
+
+  size_t next_size = strlen(first_used) + strlen(second_used) + 1; // +1 for terminator
+  char* ret = malloc(next_size * sizeof(char));
+  if (ret) {
+    char* ret_walk = ret;
+    while (*first_used != '\0') {
+      *ret_walk++ = *first_used++;
+    }
+    while (*second_used != '\0') {
+      *ret_walk++ = *second_used++;
+    }
+    *ret_walk++ = '\0';
+  }
+
+  free(first);
+  free(second);
+  return ret;
+}
+
+// perror_arg is a string literal, just like the arg to perror
+//
+// error_msg_so_far arg: 
+// - is owned (malloc)
+// - can be NULL (treated as empty)
+// - will be freed by this function
+static char* c_aot_err_strcat_perror(char* error_msg_so_far, const char* perror_arg) {
+  char* formatted = c_aot_err_printf_owned("%s: %s\n", perror_arg, strerror(errno));
+  char* ret = c_aot_err_strcat(error_msg_so_far, formatted);
+  return ret;
+}
+
+// appends data with length to the error message. if null bytes are
+// contained in the data, then it will appear to terminate early
+//
+// error_msg_so_far arg: 
+// - is owned (malloc)
+// - can be NULL (treated as empty)
+// - will be freed by this function  
+//
+// data is NOT owned and will point to num_elements bytes
+static char* c_aot_err_strcat_len(char* error_msg_so_far, const char* data, size_t num_elements) {
+  char* msg_used = error_msg_so_far ? error_msg_so_far : "";
+
+  char* ret = malloc((strlen(msg_used) + num_elements + 1) * sizeof(char));
+  if (ret) {
+    char* ret_walk = ret;
+    while (*msg_used != '\0') {
+      *ret_walk++ = *msg_used++;
+    }
+    for (size_t i = 0; i < num_elements; ++i) {
+      *ret_walk++ = data[i];
+    }
+    *ret_walk++ = '\0';
+  }
+
+  free(error_msg_so_far);
+  return ret;
+}
+
+// ================================== c aot result type ==========================
+
+enum c_aot_compile_result_type {
+  C_AOT_COMPILE_OK,
+  C_AOT_COMPILE_ERR,
+};
+
+union c_aot_compile_result_value {
+  // only if C_AOT_COMPILE_OK.
+  // OWNED, must be freed with dlclose
+  // never NULL
+  void* dl_handle;
+  // only if C_AOT_COMPILE_ERR.
+  // OWNED, must be freed with free.
+  // never NULL
+  char* error_msg;
+};
+
+// variant type. either err with error message, or ok with handle
+struct c_aot_compile_result {
+  enum c_aot_compile_result_type type;
+  union c_aot_compile_result_value value;
+};
+
+// ================================== c aot result type wrapper of string manipulation functions ==========================
+
+// checks if OK value is contained. destroys it.
+//
+// returns OWNED error message (NULL on no error)
+static char* c_aot_compile_result_convert_to_err(struct c_aot_compile_result* ret) {
+  if (ret->type != C_AOT_COMPILE_OK) {
+    // already contains error. nothing to do
+    return NULL;
+  }
+
+  void* dl_handle_to_destroy = ret->value.dl_handle;
+  ret->value.dl_handle = NULL;
+
+  ret->type = C_AOT_COMPILE_ERR;
+  ret->value.error_msg = NULL; // intentionally redundant (ptr union already set)
+
+  if (dl_handle_to_destroy == NULL) {
+    // ok value was contained, but it wasn't set yet. nothing more to do
+    return NULL;
+  }
+
+  // do destruction of previously contained ok value
+  if (dlclose(dl_handle_to_destroy) == 0) {
+    return NULL; // no err
+  }
+
+  char* reason = dlerror();
+  char* reason_msg;
+  if (reason) {
+    reason_msg = c_aot_err_printf_owned("dlclose: %s\n", reason);
+  } else {
+    // make owned on either branch
+    reason_msg = strdup("dlclose failed for an unknown reason\n");
+  }
+  return reason_msg;
+}
+
+static void c_aot_compile_result_append_error(struct c_aot_compile_result* ret, char* msg) {
+  char* destroy_error = c_aot_compile_result_convert_to_err(ret);
+  ret->value.error_msg = c_aot_err_strcat(ret->value.error_msg, msg);
+  ret->value.error_msg = c_aot_err_strcat(ret->value.error_msg, destroy_error);
+}
+
+static void c_aot_compile_result_append_error_perror(struct c_aot_compile_result* ret, const char* perror_arg) {
+  char* destroy_error = c_aot_compile_result_convert_to_err(ret);
+  ret->value.error_msg = c_aot_err_strcat_perror(ret->value.error_msg, perror_arg);
+  ret->value.error_msg = c_aot_err_strcat(ret->value.error_msg, destroy_error);
+}
+
+static void c_aot_compile_result_append_error_len(struct c_aot_compile_result* ret, const char* data, size_t num_elements) {
+  char* destroy_error = c_aot_compile_result_convert_to_err(ret);
+  ret->value.error_msg = c_aot_err_strcat_len(ret->value.error_msg, data, num_elements);
+  ret->value.error_msg = c_aot_err_strcat(ret->value.error_msg, destroy_error);
+}
+
+// ==========================================================================================================
+
 // compiler_args is a null terminating list of cstr args which are passed to the
-// compiler. some args are already specified; compiler_args is appended to args.
-void* c_aot_compile(const char* c_compiler, const char* program_begin, const char* program_end, const char* const* compiler_args) {
+// compiler. some args are already specified; compiler_args is appended to
+// existing args.
+struct c_aot_compile_result c_aot_compile(const char* c_compiler, const char* program_begin, const char* program_end, const char* const* compiler_args) {
   int stdin_pipe[2] = {-1, -1};
   int stderr_pipe[2] = {-1, -1};
   // a memory file must be used here instead of a pipe, as otherwise this causes
   // gcc output to fail (/usr/bin/ld: final link failed: Illegal seek)
   int code_fd = -1;
 
-  void* ret = NULL;
+  struct c_aot_compile_result ret;
+  ret.type = C_AOT_COMPILE_OK;
+  ret.value.dl_handle = NULL;
+
   pid_t pid;
 
   if (pipe(stdin_pipe) == -1) {
-    perror("pipe");
+    c_aot_compile_result_append_error_perror(&ret, "pipe");
     goto end;
   }
 
   if (pipe(stderr_pipe) == -1) {
-    perror("pipe");
+    c_aot_compile_result_append_error_perror(&ret, "pipe");
     goto end;
   }
 
   code_fd = memfd_create("dynamic_compiled_shared_library", 0);
   if (code_fd == -1) {
-    perror("memfd_create");
+    c_aot_compile_result_append_error_perror(&ret, "memfd_create");
     goto end;
   }
 
@@ -50,7 +234,7 @@ void* c_aot_compile(const char* c_compiler, const char* program_begin, const cha
     int printf_result = snprintf(compile_output_file, //
                                  sizeof(compile_output_file), "/dev/fd/%d", code_fd);
     if (printf_result < 0 || (unsigned long)printf_result >= sizeof(compile_output_file)) {
-      fputs("format error", stderr);
+      c_aot_compile_result_append_error(&ret, strdup("format error\n"));
       goto end;
     }
   }
@@ -58,7 +242,7 @@ void* c_aot_compile(const char* c_compiler, const char* program_begin, const cha
   pid = fork();
 
   if (pid < 0) {
-    perror("fork");
+    c_aot_compile_result_append_error_perror(&ret, "fork");
     goto end;
   }
 
@@ -210,7 +394,7 @@ void* c_aot_compile(const char* c_compiler, const char* program_begin, const cha
 
   // write then close the input
   if (write(stdin_pipe[1], program_begin, program_end - program_begin) == -1) {
-    perror("write");
+    c_aot_compile_result_append_error_perror(&ret, "write");
     goto end;
   }
 
@@ -220,7 +404,7 @@ void* c_aot_compile(const char* c_compiler, const char* program_begin, const cha
     int close_result = close(stdin_pipe[1]);
     stdin_pipe[1] = -1;
     if (close_result == -1) {
-      perror("close");
+      c_aot_compile_result_append_error_perror(&ret, "close");
       goto end;
     }
   }
@@ -231,7 +415,7 @@ void* c_aot_compile(const char* c_compiler, const char* program_begin, const cha
     int close_result = close(stderr_pipe[1]);
     stderr_pipe[1] = -1;
     if (close_result == -1) {
-      perror("close");
+      c_aot_compile_result_append_error_perror(&ret, "close");
       goto end;
     }
   }
@@ -251,7 +435,7 @@ void* c_aot_compile(const char* c_compiler, const char* program_begin, const cha
     while (compiler_stderr_size != COMPILER_STDERR_BUF_CAPACITY) {
       size_t read_ret = read(stderr_pipe[0], compiler_stderr_buf + compiler_stderr_size, COMPILER_STDERR_BUF_CAPACITY - compiler_stderr_size);
       if (read_ret < 0) {
-        perror("reading compiler's stderr");
+        c_aot_compile_result_append_error_perror(&ret, "reading compiler's stderr");
         goto end;
       }
       if (read_ret == 0) {
@@ -265,7 +449,7 @@ void* c_aot_compile(const char* c_compiler, const char* program_begin, const cha
       char discard[1024];
       size_t read_ret = read(stderr_pipe[0], discard, sizeof(discard) / sizeof(char));
       if (read_ret < 0) {
-        perror("reading compiler's stderr");
+        c_aot_compile_result_append_error_perror(&ret, "reading compiler's stderr");
         goto end;
       }
       if (read_ret == 0) {
@@ -279,7 +463,7 @@ void* c_aot_compile(const char* c_compiler, const char* program_begin, const cha
 
     int child_return_status;
     if (waitpid(pid, &child_return_status, 0) == -1) {
-      perror("waitpid");
+      c_aot_compile_result_append_error_perror(&ret, "waitpid");
       goto end;
     }
 
@@ -288,10 +472,12 @@ void* c_aot_compile(const char* c_compiler, const char* program_begin, const cha
     }
 
     if (child_return_status != 0) {
-      fprintf(stderr, "child process started for compiler \"%s\" exited with code %d. stderr:\n", c_compiler, child_return_status);
-      fwrite(compiler_stderr_buf, sizeof(char), compiler_stderr_size, stderr);
+      char* formatted_str = c_aot_err_printf_owned("child process for compiler \"%s\" exited with code %d. stderr:\n", c_compiler, child_return_status);
+      c_aot_compile_result_append_error(&ret, formatted_str);
+      c_aot_compile_result_append_error_len(&ret, compiler_stderr_buf, compiler_stderr_size);
       if (compiler_stderr_was_truncated) {
-        fprintf(stderr, "\n... stderr from \"%s\" was truncated\n", c_compiler);
+        char* truncate_msg_formatted = c_aot_err_printf_owned("\n... stderr from \"%s\" was truncated\n", c_compiler);
+        c_aot_compile_result_append_error(&ret, truncate_msg_formatted);
       }
       goto end;
     }
@@ -301,14 +487,18 @@ void* c_aot_compile(const char* c_compiler, const char* program_begin, const cha
     void* handle = dlopen(compile_output_file, RTLD_NOW);
     if (handle == NULL) {
       char* reason = dlerror();
+      char* fmt_err;
       if (reason) {
-        fprintf(stderr, "dlopen: %s\n", reason);
+        fmt_err = c_aot_err_printf_owned("dlopen: %s\n", reason);
       } else {
-        fputs("dlopen failed for an unknown reason", stderr);
+        fmt_err = strdup("dlopen failed for an unknown reason");
       }
+      c_aot_compile_result_append_error(&ret, fmt_err);
       goto end;
     }
-    ret = handle;
+    if (ret.type == C_AOT_COMPILE_OK) {
+      ret.value.dl_handle = handle;
+    }
   }
 
 end:
@@ -320,27 +510,14 @@ end:
   if (code_fd != -1) close_errored |= close(code_fd);
 
   if (close_errored) {
-    perror("close");
-    if (ret != NULL) {
-      // yoink. no longer returning the handle since there were errors while cleaning up
-      if (dlclose(ret) != 0) {
-        char* reason = dlerror();
-        if (reason) {
-          fprintf(stderr, "dlclose: %s\n", reason);
-        } else {
-          fputs("dlclose failed for an unknown reason", stderr);
-        }
-      }
-      ret = NULL;
-      // end of yoink
-    }
+    c_aot_compile_result_append_error_perror(&ret, "close");
   }
 
   return ret;
 }
 
 // overload for compile
-void* c_aot_compile_no_args(const char* c_compiler, const char* program_begin, const char* program_end) {
+struct c_aot_compile_result c_aot_compile_no_args(const char* c_compiler, const char* program_begin, const char* program_end) {
   const char* compiler_args = NULL;
   return c_aot_compile(c_compiler, program_begin, program_end, &compiler_args);
 }
