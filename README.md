@@ -25,11 +25,12 @@ It's [not a new idea](https://forums.raspberrypi.com/viewtopic.php?t=319919#p196
 The lib tries its very best to encourage the compiler to never write to disk:
  - Temp files are in memory
  - The output object is stored in memory
+ - tcc writes directly to memory, and is the most reliable in this regard (it was built for this!)
 
 ## Example
 
 ```bash
-cc main.c -DRUNTIME_C_COMPILER=cc -D_GNU_SOURCE
+cc main.c -DRUNTIME_C_COMPILER=cc -D_GNU_SOURCE -ldl
 ```
 
 ```c
@@ -90,7 +91,7 @@ int add(int a, int b) {return a + b;}";
         if (reason) {
             fprintf(stderr, "dlclose: %s\n", reason);
         } else {
-            fputs("dlclose failed for an unknown reason", stderr);
+            fputs("dlclose failed for an unknown reason\n", stderr);
         }
         return 1;
     }

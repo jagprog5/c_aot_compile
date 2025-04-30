@@ -6,7 +6,6 @@
 
 #include <dlfcn.h>
 #include <fcntl.h>
-#include <string.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -129,7 +128,7 @@ union c_aot_compile_result_value {
   void* dl_handle;
   // only if C_AOT_COMPILE_ERR.
   // OWNED, must be freed with free.
-  // never NULL
+  // might be NULL only on alloc failure
   char* error_msg;
 };
 
@@ -211,7 +210,8 @@ struct c_aot_compile_result c_aot_compile(const char* c_compiler, const char* pr
   ret.type = C_AOT_COMPILE_OK;
   ret.value.dl_handle = NULL;
 
-  pid_t pid;
+  // non zero only if in parent and child is running or hasn't been "reaped"
+  pid_t pid = 0;
 
   if (pipe(stdin_pipe) == -1) {
     c_aot_compile_result_append_error_perror(&ret, "pipe");
@@ -433,7 +433,7 @@ struct c_aot_compile_result c_aot_compile(const char* c_compiler, const char* pr
     bool compiler_stderr_was_truncated = false;
 
     while (compiler_stderr_size != COMPILER_STDERR_BUF_CAPACITY) {
-      size_t read_ret = read(stderr_pipe[0], compiler_stderr_buf + compiler_stderr_size, COMPILER_STDERR_BUF_CAPACITY - compiler_stderr_size);
+      ssize_t read_ret = read(stderr_pipe[0], compiler_stderr_buf + compiler_stderr_size, COMPILER_STDERR_BUF_CAPACITY - compiler_stderr_size);
       if (read_ret < 0) {
         c_aot_compile_result_append_error_perror(&ret, "reading compiler's stderr");
         goto end;
@@ -447,7 +447,7 @@ struct c_aot_compile_result c_aot_compile(const char* c_compiler, const char* pr
     // the stderr buffer is full, discard any remaining
     while (1) {
       char discard[1024];
-      size_t read_ret = read(stderr_pipe[0], discard, sizeof(discard) / sizeof(char));
+      ssize_t read_ret = read(stderr_pipe[0], discard, sizeof(discard) / sizeof(char));
       if (read_ret < 0) {
         c_aot_compile_result_append_error_perror(&ret, "reading compiler's stderr");
         goto end;
@@ -459,13 +459,15 @@ struct c_aot_compile_result c_aot_compile(const char* c_compiler, const char* pr
       compiler_stderr_was_truncated = true;
     }
 
-    after_discard_compiler_stderr:
+    after_discard_compiler_stderr:;
 
     int child_return_status;
     if (waitpid(pid, &child_return_status, 0) == -1) {
+      pid = 0; // failed waiting for it. don't try waitpid again during cleanup
       c_aot_compile_result_append_error_perror(&ret, "waitpid");
       goto end;
     }
+    pid = 0; // successfully closed out and finished
 
     if (WIFEXITED(child_return_status)) {
       child_return_status = WEXITSTATUS(child_return_status);
@@ -491,7 +493,7 @@ struct c_aot_compile_result c_aot_compile(const char* c_compiler, const char* pr
       if (reason) {
         fmt_err = c_aot_err_printf_owned("dlopen: %s\n", reason);
       } else {
-        fmt_err = strdup("dlopen failed for an unknown reason");
+        fmt_err = strdup("dlopen failed for an unknown reason\n");
       }
       c_aot_compile_result_append_error(&ret, fmt_err);
       goto end;
@@ -501,16 +503,42 @@ struct c_aot_compile_result c_aot_compile(const char* c_compiler, const char* pr
     }
   }
 
-end:
-  int close_errored = 0;
-  if (stdin_pipe[0] != -1) close_errored |= close(stdin_pipe[0]);
-  if (stdin_pipe[1] != -1) close_errored |= close(stdin_pipe[1]);
-  if (stderr_pipe[0] != -1) close_errored |= close(stderr_pipe[0]);
-  if (stderr_pipe[1] != -1) close_errored |= close(stderr_pipe[1]);
-  if (code_fd != -1) close_errored |= close(code_fd);
+end:;
+  if (stdin_pipe[0] != -1) {
+    if (close(stdin_pipe[0])) {
+      c_aot_compile_result_append_error_perror(&ret, "close stdin read fd");
+    }
+  }
+  if (stdin_pipe[1] != -1) {
+    if (close(stdin_pipe[1])) {
+      c_aot_compile_result_append_error_perror(&ret, "close stdin write fd");
+    }
+  }
 
-  if (close_errored) {
-    c_aot_compile_result_append_error_perror(&ret, "close");
+  if (stderr_pipe[0] != -1) {
+    if (close(stderr_pipe[0])) {
+      c_aot_compile_result_append_error_perror(&ret, "close stderr read fd");
+    }
+  }
+  if (stderr_pipe[1] != -1) {
+    if (close(stderr_pipe[1])) {
+      c_aot_compile_result_append_error_perror(&ret, "close stderr write fd");
+    }
+  }
+
+  if (code_fd != -1) {
+    if (close(code_fd)) {
+      c_aot_compile_result_append_error_perror(&ret, "close stdin mem file fd");
+    }
+  }
+
+  if (pid != 0) {
+    // only happens in error context (from reading or writing failing. goes to
+    // end and skipped the above waitpid). ensure pid is reaped
+    if (waitpid(pid, NULL, 0) == -1) {
+      c_aot_compile_result_append_error_perror(&ret, "waitpid after child pipe failure");
+    }
+    pid = 0; // intentional redundant
   }
 
   return ret;
