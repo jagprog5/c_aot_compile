@@ -199,7 +199,16 @@ static void c_aot_compile_result_append_error_len(struct c_aot_compile_result* r
 // compiler_args is a null terminating list of cstr args which are passed to the
 // compiler. some args are already specified; compiler_args is appended to
 // existing args.
-struct c_aot_compile_result c_aot_compile(const char* c_compiler, const char* program_begin, const char* program_end, const char* const* compiler_args) {
+//
+// warning! given that this is a JIT, it's an avenue for arbitrary code
+// execution. it's assumed that the input program is properly sanitized -
+// ideally have constant programs which are chosen at runtime. additionally,
+// c_compiler is the program to execute - should also be a set constant
+struct c_aot_compile_result c_aot_compile(const char* program_begin, const char* program_end, const char* c_compiler, const char* const* compiler_args) {
+  if (!c_compiler) {
+    c_compiler = "cc";
+  }
+
   int stdin_pipe[2] = {-1, -1};
   int stderr_pipe[2] = {-1, -1};
   // a memory file must be used here instead of a pipe, as otherwise this causes
@@ -223,17 +232,22 @@ struct c_aot_compile_result c_aot_compile(const char* c_compiler, const char* pr
     goto end;
   }
 
+  // deliberate no MFD_CLOEXEC - written to by child program
   code_fd = memfd_create("dynamic_compiled_shared_library", 0);
   if (code_fd == -1) {
     c_aot_compile_result_append_error_perror(&ret, "memfd_create");
     goto end;
   }
-
+  
+  // buffer is well over maximum output size. and snprintf guards overflow
+  // "/dev/fd/" → 8  
+  // "2147483647" → 10  
+  // "\0" → 1
   char compile_output_file[32];
   {
     int printf_result = snprintf(compile_output_file, //
                                  sizeof(compile_output_file), "/dev/fd/%d", code_fd);
-    if (printf_result < 0 || (unsigned long)printf_result >= sizeof(compile_output_file)) {
+    if (printf_result < 0 || (size_t)printf_result >= sizeof(compile_output_file)) {
       c_aot_compile_result_append_error(&ret, strdup("format error\n"));
       goto end;
     }
@@ -271,11 +285,12 @@ struct c_aot_compile_result c_aot_compile(const char* c_compiler, const char* pr
       exit(EXIT_FAILURE); // in child process - exit now
     }
 
-    char compile_output_file_arg[34];
+    // buffer size ok, only 2 characters are added from above
+    char compile_output_file_arg[sizeof(compile_output_file) / sizeof(*compile_output_file) + 2];
     {
       int printf_result = snprintf(compile_output_file_arg, //
                                    sizeof(compile_output_file_arg), "-o%s", compile_output_file);
-      if (printf_result < 0 || (unsigned long)printf_result >= sizeof(compile_output_file_arg)) {
+      if (printf_result < 0 || (size_t)printf_result >= sizeof(compile_output_file_arg)) {
         fputs("format error before compiler started", stderr);
         exit(EXIT_FAILURE); // in child process - exit now
       }
@@ -286,7 +301,7 @@ struct c_aot_compile_result c_aot_compile(const char* c_compiler, const char* pr
       ++num_extra_args;
     }
 
-    // copy required since args are non const
+    // copy required since args are non const. TODO VLA should not be used
     char* args[9 + num_extra_args];
 
     // first arg always is self
@@ -426,7 +441,7 @@ struct c_aot_compile_result c_aot_compile(const char* c_compiler, const char* pr
     
     // reading will always occur, but only if there is a failure exit status then it will be displayed.
     // only n bytes will be read, and the reset is discarded (constant space)
-    const size_t COMPILER_STDERR_BUF_CAPACITY = 500;
+    const size_t COMPILER_STDERR_BUF_CAPACITY = 1024;
     size_t compiler_stderr_size = 0;
     char compiler_stderr_buf[COMPILER_STDERR_BUF_CAPACITY];
 
@@ -446,7 +461,7 @@ struct c_aot_compile_result c_aot_compile(const char* c_compiler, const char* pr
 
     // the stderr buffer is full, discard any remaining
     while (1) {
-      char discard[1024];
+      char discard[COMPILER_STDERR_BUF_CAPACITY]; // any positive cap would work
       ssize_t read_ret = read(stderr_pipe[0], discard, sizeof(discard) / sizeof(char));
       if (read_ret < 0) {
         c_aot_compile_result_append_error_perror(&ret, "reading compiler's stderr");
@@ -485,7 +500,9 @@ struct c_aot_compile_result c_aot_compile(const char* c_compiler, const char* pr
     }
   }
 
-  {
+  // ret is guaranteed OK right now, since in all cases above, on err it goto
+  // end (skipping here). but adding the if condition anyways just in case
+  if (ret.type == C_AOT_COMPILE_OK) {
     void* handle = dlopen(compile_output_file, RTLD_NOW);
     if (handle == NULL) {
       char* reason = dlerror();
@@ -497,8 +514,7 @@ struct c_aot_compile_result c_aot_compile(const char* c_compiler, const char* pr
       }
       c_aot_compile_result_append_error(&ret, fmt_err);
       goto end;
-    }
-    if (ret.type == C_AOT_COMPILE_OK) {
+    } else {
       ret.value.dl_handle = handle;
     }
   }
@@ -542,10 +558,4 @@ end:;
   }
 
   return ret;
-}
-
-// overload for compile
-struct c_aot_compile_result c_aot_compile_no_args(const char* c_compiler, const char* program_begin, const char* program_end) {
-  const char* compiler_args = NULL;
-  return c_aot_compile(c_compiler, program_begin, program_end, &compiler_args);
 }

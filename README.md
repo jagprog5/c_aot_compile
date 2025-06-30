@@ -30,7 +30,7 @@ The lib tries its very best to encourage the compiler to never write to disk:
 ## Example
 
 ```bash
-cc main.c -DRUNTIME_C_COMPILER=cc -D_GNU_SOURCE -ldl
+cc main.c -D_GNU_SOURCE -ldl
 ```
 
 ```c
@@ -39,11 +39,6 @@ cc main.c -DRUNTIME_C_COMPILER=cc -D_GNU_SOURCE -ldl
 #include <string.h>
 
 #include "c_aot_compile.h"
-
-#ifndef RUNTIME_C_COMPILER
-    // for example, in a makefile add: -DRUNTIME_C_COMPILER=$(CC)
-    #error "RUNTIME_C_COMPILER must be defined to a c compiler"
-#endif
 
 // Stringify the RUNTIME_C_COMPILER macro
 #define STR(x) #x
@@ -58,14 +53,11 @@ int main(void) {
     #error arg pass failure\n\
 #endif\n\
 int add(int a, int b) {return a + b;}";
-    const char* compiler = XSTR(RUNTIME_C_COMPILER);
     const char* const compile_args[] = {"-DMUST_BE_DEFINED", "-DMUST_BE_DEFINED2", NULL};
 
     // ================= IMPORTANT LINE HERE ================= 
     struct c_aot_compile_result result = c_aot_compile(
-            compiler,
-            program, program + strlen(program),
-            compile_args);
+            program, program + strlen(program), NULL, compile_args);
     // =================================================
 
     if (result.type == C_AOT_COMPILE_ERR) {
