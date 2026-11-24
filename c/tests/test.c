@@ -1,5 +1,9 @@
 // build (linux, macos): cc tests/test.c -I. -ldl -o /tmp/c_aot_test && /tmp/c_aot_test
 // build (windows, mingw): gcc tests/test.c -I. -o c_aot_test.exe && ./c_aot_test.exe
+// msvc's headers deprecate getenv and friends (an error with -Werror)
+#ifndef _CRT_SECURE_NO_WARNINGS
+#define _CRT_SECURE_NO_WARNINGS
+#endif
 // the header goes first: it defines _GNU_SOURCE, which only works before any system header
 #include "../c_aot_compile.h"
 

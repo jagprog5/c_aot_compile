@@ -582,13 +582,14 @@ static struct c_aot_compile_result c_aot_compile(const char* source, size_t sour
       c_aot_set_err(&result, "LoadLibrary: %s\n", C_AOT_ERRNO);
       goto end;
     }
-    char* dir_copy = malloc(strlen(tmp_dir) + 1);
+    size_t dir_size = strlen(tmp_dir) + 1;
+    char* dir_copy = malloc(dir_size);
     if (!dir_copy) {
       FreeLibrary(handle);
       c_aot_set_err(&result, "out of memory\n");
       goto end;
     }
-    strcpy(dir_copy, tmp_dir);
+    memcpy(dir_copy, tmp_dir, dir_size);
     result.type = C_AOT_COMPILE_OK;
     result.value.dl_handle = (void*)handle;
     result.code_file = (void*)lib_file; // ownership moves to the result
