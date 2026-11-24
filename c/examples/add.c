@@ -1,4 +1,4 @@
-// build: cc examples/add.c -ldl (from the c/ directory)
+// build: cc examples/add.c -ldl (from the c/ directory). windows (mingw): gcc examples/add.c
 // the header goes first: it defines _GNU_SOURCE, which only works before any system header
 #include "../c_aot_compile.h"
 
@@ -22,7 +22,7 @@ int add(int a, int b) {return a + b;}";
 
     // ================= IMPORTANT LINE HERE ================= 
     struct c_aot_compile_result result = c_aot_compile(
-            program, program + strlen(program), NULL, compile_args);
+            program, strlen(program), NULL, compile_args);
     // =================================================
 
     if (result.type == C_AOT_COMPILE_ERR) {
@@ -31,11 +31,9 @@ int add(int a, int b) {return a + b;}";
         return 1;
     }
 
-    void* dl_handle = result.value.dl_handle;
-
     int (*add_symbol)(int, int);
-    // https://linux.die.net/man/3/dlopen
-    *(void**)(&add_symbol) = dlsym(dl_handle, "add");
+    // dlsym / GetProcAddress
+    *(void**)(&add_symbol) = c_aot_compile_symbol(&result, "add");
     if (add_symbol == NULL) {
         fputs("failed to resolve symbol", stderr);
         return 1;
@@ -43,7 +41,7 @@ int add(int a, int b) {return a + b;}";
 
     assert((*add_symbol)(1, 2) == 3);
 
-    // closes the library (dlclose) and the file it was loaded from.
+    // unloads the library and closes the file it was loaded from.
     // the file must stay open as long as the library is loaded
     c_aot_compile_result_destroy(&result);
     puts("Ok!");

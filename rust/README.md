@@ -1,6 +1,6 @@
 # c_aot_compile (Rust)
 
-Compile C source at runtime with the system C compiler, then load it. Linux and macOS.
+Compile C source at runtime with the system C compiler, then load it. Linux, macOS and Windows (gcc style compiler; see the top-level README).
 See the [top-level README](../README.md) for the design; API docs are in `src/lib.rs` (`cargo doc --open`).
 
 ```rust

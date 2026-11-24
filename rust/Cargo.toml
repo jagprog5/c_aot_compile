@@ -2,8 +2,8 @@
 name = "c_aot_compile"
 version = "0.1.0"
 edition = "2021"
-description = "Compile C source at runtime with the system C compiler and load it (Linux, macOS)"
+description = "Compile C source at runtime with the system C compiler and load it (Linux, macOS, Windows)"
 license = "MIT OR Apache-2.0"
 
-[dependencies]
+[target.'cfg(unix)'.dependencies]
 libc = "0.2"

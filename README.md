@@ -37,9 +37,11 @@ It's [not a new idea](https://forums.raspberrypi.com/viewtopic.php?t=319919#p196
 
 - **Safe by default:** no hangs, truncated input, or silently loading the wrong code, including when
   called from several threads.
-- **Simple and portable:** one design on every platform, using only plain POSIX calls. Each compile gets a fresh
-  private (`0700`) temp directory (under `TMPDIR`, else `/tmp`). The source and the compiled library are files
-  in it, and the directory is removed before the call returns, whether it succeeded or not.
+- **Simple and portable:** one design on every platform, using each platform's plain process and loader calls
+  (`posix_spawn` and `dlopen`; `CreateProcess` and `LoadLibrary`). Each compile gets a fresh private temp
+  directory (under `TMPDIR`, else `/tmp`; `TMP` / `TEMP` on Windows). The source and the compiled library are
+  files in it, and the directory is removed before the call returns (on Windows: when the library is unloaded,
+  since a loaded dll can't be deleted), whether it succeeded or not.
 
 ### Files on disk
 
@@ -52,8 +54,12 @@ library file. The directory is private to your user, so other users can't.
 
 ## Platform support
 
-Linux and macOS, for both the C header and the Rust crate. Other POSIX systems with `posix_spawn`, `mkdtemp` and
-`dlopen` likely work too.
+Linux, macOS and Windows, for both the C header and the Rust crate, all tested in CI. Other POSIX systems with
+`posix_spawn`, `mkdtemp` and `dlopen` likely work too.
+
+On Windows the compiler must have a gcc style command line (mingw gcc, clang, tcc); the default is `gcc`. MSVC's
+`cl` isn't supported. Symbols must be exported to be found: mingw gcc exports every global symbol unless something
+is marked `__declspec(dllexport)`, while other toolchains need it on whatever you look up.
 
 ## Security
 
