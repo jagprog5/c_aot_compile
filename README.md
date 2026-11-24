@@ -1,6 +1,16 @@
 # Runtime C Compilation
 
-This facilitates compilation at runtime by piping C source code to a compiler and linking against the shared object.
+Emit then compile C source at runtime with a compiler. Available as a single C header and as a Rust crate. Both
+implement the same design.
+
+Is it JIT or AOT? Both, in a sense: the machine code is generated while your program runs (JIT-like flexibility), but
+by an ordinary ahead-of-time compiler that compiles a whole unit up front. There is no lazy per-function compilation
+or recompilation of hot code, so expect tens of milliseconds per compile, not microseconds.
+
+|      | Directory        | Use it as                                  |
+| ---- | ---------------- | ------------------------------------------ |
+| C    | [`c/`](c/)       | copy `c/c_aot_compile.h` into your project |
+| Rust | [`rust/`](rust/) | `c_aot_compile = { path = "rust" }`        |
 
 ## But wait, this adds a whole compiler as a dependency?
 
@@ -8,9 +18,12 @@ Yes.
 
 And that might be ok! Consider the following:
 
- - This lib works with all major compilers including: tcc, gcc, clang. Likely others as well.
- - POSIX requires a C compiler. If your target is POSIX, then your dependency will be there!
- - Note [tcc](https://bellard.org/tcc/). It's whole spiel is that it's tiny. If needed, add tcc to the package.
+- This lib works with all major compilers including: tcc, gcc, clang. Likely
+  others as well, and gets the same gains for free.
+- POSIX requires a C compiler. If your target is POSIX, then your dependency
+  will be there!
+- Note [tcc](https://bellard.org/tcc/). It's whole spiel is that it's tiny. If
+  needed, add tcc to the package.
 
 ## Background
 
@@ -20,74 +33,31 @@ But all of them are harder to use! And they're pretty big! With this lib, just c
 
 It's [not a new idea](https://forums.raspberrypi.com/viewtopic.php?t=319919#p1962876). In fact, there's a [jit implementation for Ruby (called MJIT)](https://blog.heroku.com/ruby-mjit#mjit) that does something similar.
 
-## Implementation Note
+## Goals
 
-The lib tries its very best to encourage the compiler to never write to disk:
- - Temp files are in memory
- - The output object is stored in memory
- - tcc writes directly to memory, and is the most reliable in this regard (it was built for this!)
+- **Safe by default:** no hangs, truncated input, or silently loading the wrong code, including when
+  called from several threads.
+- **Avoid writing to disk where possible:** the source and the compiled library live in memory files and
+  `TMPDIR` points at `/dev/shm`. This is best effort, not a guarantee: the compiler is a separate program, and
+  anything that ignores `TMPDIR` or writes elsewhere (caches, extra args you pass) can still touch disk. tcc
+  writes directly to memory and is the most reliable in this regard (it was built for this!)
 
-## Example
+## Platform support
 
-```bash
-cc main.c -D_GNU_SOURCE -ldl
-```
+Linux only (`memfd_create`, `/dev/fd` needs `/proc`). Tested on glibc and musl (Alpine).
 
-```c
-// main.c
-#include <assert.h>
-#include <string.h>
+## Security
 
-#include "c_aot_compile.h"
+This is a JIT: it executes arbitrary code. Source and compiler must be trusted.
+The header comment and the crate docs list the details (environment passthrough, `PATH` lookup, diagnostics leaking file contents).
 
-// Stringify the RUNTIME_C_COMPILER macro
-#define STR(x) #x
-#define XSTR(x) STR(x)
+## License
 
-int main(void) {
-    const char* program = "\
-#ifndef MUST_BE_DEFINED\n\
-    #error arg pass failure\n\
-#endif\n\
-#ifndef MUST_BE_DEFINED2\n\
-    #error arg pass failure\n\
-#endif\n\
-int add(int a, int b) {return a + b;}";
-    const char* const compile_args[] = {"-DMUST_BE_DEFINED", "-DMUST_BE_DEFINED2", NULL};
+Licensed under either of
 
-    // ================= IMPORTANT LINE HERE ================= 
-    struct c_aot_compile_result result = c_aot_compile(
-            program, program + strlen(program), NULL, compile_args);
-    // =================================================
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
+- MIT license ([LICENSE-MIT](LICENSE-MIT))
 
-    if (result.type == C_AOT_COMPILE_ERR) {
-        fputs(result.value.error_msg, stderr);
-        free(result.value.error_msg);
-        return 1;
-    }
+at your option.
 
-    void* dl_handle = result.value.dl_handle;
-
-    int (*add_symbol)(int, int);
-    // https://linux.die.net/man/3/dlopen
-    *(void**)(&add_symbol) = dlsym(dl_handle, "add");
-    if (add_symbol == NULL) {
-        fputs("failed to resolve symbol", stderr);
-        return 1;
-    }
-
-    assert((*add_symbol)(1, 2) == 3);
-
-    if (dlclose(dl_handle) != 0) {
-        char* reason = dlerror();
-        if (reason) {
-            fprintf(stderr, "dlclose: %s\n", reason);
-        } else {
-            fputs("dlclose failed for an unknown reason\n", stderr);
-        }
-        return 1;
-    }
-    puts("Ok!");
-    return 0;
-}
-```
+Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in this work, as defined in the Apache-2.0 license, shall be dual licensed as above, without any additional terms or conditions.
