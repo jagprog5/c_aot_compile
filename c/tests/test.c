@@ -42,8 +42,10 @@ int main(void) {
   size_t n = 4 << 20;
   char* big = malloc(n);
   memset(big, 'x', n);
-  struct c_aot_compile_result dead = c_aot_compile(big, big + n, "/bin/false", NULL);
+  // "false" via PATH: it's /bin/false on linux, /usr/bin/false on macos
+  struct c_aot_compile_result dead = c_aot_compile(big, big + n, "false", NULL);
   assert(dead.type == C_AOT_COMPILE_ERR);
+  assert(dead.value.error_msg && strstr(dead.value.error_msg, "exited with code")); // it really ran
   c_aot_compile_result_destroy(&dead);
   free(big);
 

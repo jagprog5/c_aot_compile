@@ -1,6 +1,7 @@
 # c_aot_compile (C)
 
-Single header (`c_aot_compile.h`), no dependencies. Linux only; link with `-ldl`.
+Single header (`c_aot_compile.h`), no dependencies. Linux and macOS. Link with `-ldl` (required on Linux with
+glibc older than 2.34, harmless elsewhere).
 Background, design, platform support and security notes are in the [top-level README](../README.md).
 
 ## Example
@@ -25,7 +26,7 @@ if (result.type == C_AOT_COMPILE_ERR) {
 int (*add)(int, int);
 *(void**)&add = dlsym(result.value.dl_handle, "add");
 // ... use add ...
-c_aot_compile_result_destroy(&result); // dlclose + closes the memory file
+c_aot_compile_result_destroy(&result); // dlclose + closes the library file
 ```
 
 ## Tests

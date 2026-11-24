@@ -37,14 +37,23 @@ It's [not a new idea](https://forums.raspberrypi.com/viewtopic.php?t=319919#p196
 
 - **Safe by default:** no hangs, truncated input, or silently loading the wrong code, including when
   called from several threads.
-- **Avoid writing to disk where possible:** the source and the compiled library live in memory files and
-  `TMPDIR` points at `/dev/shm`. This is best effort, not a guarantee: the compiler is a separate program, and
-  anything that ignores `TMPDIR` or writes elsewhere (caches, extra args you pass) can still touch disk. tcc
-  writes directly to memory and is the most reliable in this regard (it was built for this!)
+- **Simple and portable:** one design on every platform, using only plain POSIX calls. Each compile gets a fresh
+  private (`0700`) temp directory (under `TMPDIR`, else `/tmp`). The source and the compiled library are files
+  in it, and the directory is removed before the call returns, whether it succeeded or not.
+
+### Files on disk
+
+The source and library do touch disk for a moment. To keep them in memory instead, point `TMPDIR` at a memory file
+system (for example `/dev/shm` on Linux). The compiler is a separate program, though, so anything that ignores
+`TMPDIR` or writes elsewhere (caches, extra args you pass) can still touch disk.
+
+Between the compiler exiting and the library being loaded, a process running as the same user could modify the
+library file. The directory is private to your user, so other users can't.
 
 ## Platform support
 
-Linux only (`memfd_create`, `/dev/fd` needs `/proc`). Tested on glibc and musl (Alpine).
+Linux and macOS, for both the C header and the Rust crate. Other POSIX systems with `posix_spawn`, `mkdtemp` and
+`dlopen` likely work too.
 
 ## Security
 

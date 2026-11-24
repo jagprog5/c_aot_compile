@@ -1,6 +1,6 @@
 //! Compile C source at runtime with the system C compiler, then load it.
 //!
-//! Linux only (`memfd_create`, `/dev/fd`, which needs `/proc` mounted).
+//! Linux and macOS (likely other Unix systems too).
 //!
 //! ```no_run
 //! let lib = c_aot_compile::compile("int add(int a, int b) { return a + b; }", None, &[])?;
@@ -22,34 +22,43 @@
 //! ```
 //!
 //! Design (mirrors the C header):
-//! - the source is given to the compiler as a memory file on stdin (no pipe to
-//!   feed, so no deadlock or `SIGPIPE` handling);
-//! - the compiler writes the library into a sealed memory file that stays open
-//!   while the library is loaded: its `/dev/fd/N` path is therefore unique
-//!   (`dlopen` returns an already loaded library for a repeated path), and the
-//!   code can't be rewritten after loading;
+//! - each compile gets a fresh private (`0700`) directory under
+//!   [`std::env::temp_dir`], removed (with everything in it) before
+//!   [`compile`] returns, whether it succeeded or not;
+//! - the source is written to a file there, unlinked right away and given to
+//!   the compiler as stdin (no pipe to feed, so no deadlock or `SIGPIPE`
+//!   handling);
+//! - the compiler writes the library to a path in that directory. The random
+//!   directory name makes the path unique (`dlopen` returns an already loaded
+//!   library for a repeated path), and [`Library`] keeps the file open while
+//!   loaded, so its inode can't be reused either;
 //! - everything is spawned through `std::process::Command`, so there is no
 //!   `fork` + custom code in a possibly threaded process.
+//!
+//! The files do touch disk (unless `TMPDIR` is a memory file system).
 //!
 //! # Security
 //! This is a JIT: an avenue for arbitrary code execution. The source and the
 //! compiler must be trusted. Also:
-//! - the environment is passed to the compiler (except `TMPDIR`, which is
-//!   forced to `/dev/shm`). `GCC_EXEC_PREFIX`, `COMPILER_PATH`, `CPATH`,
-//!   `LIBRARY_PATH`, `LD_PRELOAD`, ... change what it runs or includes;
+//! - the environment is passed to the compiler unchanged. `GCC_EXEC_PREFIX`,
+//!   `COMPILER_PATH`, `CPATH`, `LIBRARY_PATH`, `LD_PRELOAD`, ... change what
+//!   it runs or includes;
 //! - a compiler name without `/` is looked up in `PATH`; prefer an absolute path;
 //! - compiler diagnostics are returned in [`Error`]; with outside-influenced
 //!   source, `#include "/secret"` can leak file fragments through them;
-//! - the compiler's stdout is the output file, so don't pass flags that print
-//!   to stdout (`-E`, `-print-*`).
+//! - between the compiler exiting and `dlopen`, a process running as the same
+//!   user could modify the library file.
 
-use std::ffi::{c_void, CStr, CString};
+use std::ffi::{c_void, CStr, CString, OsString};
 use std::fmt;
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::{self, Read, Seek, Write};
 use std::marker::PhantomData;
 use std::ops::Deref;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::OwnedFd;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::ptr::NonNull;
 
@@ -96,8 +105,8 @@ fn io_err(context: &'static str) -> impl FnOnce(io::Error) -> Error {
 /// A loaded, compiled library. Unloaded on drop.
 pub struct Library {
     handle: NonNull<c_void>,
-    // Closed only after `dlclose` (drop body runs before fields drop). It must
-    // stay open while loaded, see the crate docs.
+    // The (already deleted) library file. Closed only after `dlclose` (drop
+    // body runs before fields drop), so its inode isn't reused while loaded.
     _code: OwnedFd,
 }
 
@@ -162,19 +171,40 @@ impl fmt::Debug for Library {
     }
 }
 
-/// Creates a close-on-exec memory file.
-fn memfd(name: &CStr, sealable: bool) -> Result<File, Error> {
-    let flags = libc::MFD_CLOEXEC | if sealable { libc::MFD_ALLOW_SEALING } else { 0 };
-    // SAFETY: name is NUL terminated.
-    let fd = unsafe { libc::memfd_create(name.as_ptr(), flags) };
-    if fd == -1 {
-        return Err(Error::Io {
-            context: "memfd_create",
-            source: io::Error::last_os_error(),
-        });
+/// A fresh private (`0700`) directory, removed with its contents on drop.
+struct TempDir(PathBuf);
+
+impl TempDir {
+    fn new() -> Result<TempDir, Error> {
+        let mut template = std::env::temp_dir()
+            .join("c_aot_compile.XXXXXX")
+            .into_os_string()
+            .into_vec();
+        template.push(0);
+        // SAFETY: template is NUL terminated and writable; mkdtemp only
+        // replaces the trailing XXXXXX.
+        if unsafe { libc::mkdtemp(template.as_mut_ptr().cast()) }.is_null() {
+            return Err(Error::Io {
+                context: "creating temp directory",
+                source: io::Error::last_os_error(),
+            });
+        }
+        template.pop(); // the NUL
+        Ok(TempDir(OsString::from_vec(template).into()))
     }
-    // SAFETY: fd is valid and exclusively ours.
-    Ok(File::from(unsafe { OwnedFd::from_raw_fd(fd) }))
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        // best effort. a loaded library stays mapped (and its fd open), so
+        // removing its file is fine
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+fn path_to_cstring(path: &Path) -> CString {
+    // the path is the temp dir (mkdtemp took it as a C string) plus a fixed name
+    CString::new(path.as_os_str().as_bytes()).expect("no NUL in the temp path")
 }
 
 /// Compiles `source` (C) to a shared library and loads it.
@@ -186,32 +216,32 @@ fn memfd(name: &CStr, sealable: bool) -> Result<File, Error> {
 pub fn compile(source: &str, compiler: Option<&str>, args: &[&str]) -> Result<Library, Error> {
     let compiler = compiler.unwrap_or("cc");
 
-    // source -> memory file, which becomes the compiler's stdin
-    let mut src = memfd(c"c_aot_source", false)?;
+    // declared first, so it's dropped (removed) last: after the child is
+    // waited on and every file in it is closed
+    let dir = TempDir::new()?;
+    let src_path = dir.0.join("src.c");
+    let lib_path = dir.0.join("lib.so");
+
+    // source -> file, unlinked at once, which becomes the compiler's stdin
+    let mut src = File::options()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&src_path)
+        .map_err(io_err("creating source file"))?;
+    let _ = fs::remove_file(&src_path); // the directory is removed anyway
     src.write_all(source.as_bytes())
         .map_err(io_err("writing source"))?;
     src.rewind().map_err(io_err("rewinding source"))?;
 
-    // the compiler writes the library to its stdout, which is this memory
-    // file (so "-o/dev/fd/1"). a memory file, not a pipe, is needed, as
-    // otherwise gcc fails (ld: final link failed: Illegal seek)
-    let out = memfd(c"c_aot_library", true)?;
-    let out_for_child = out.try_clone().map_err(io_err("dup library fd"))?;
-
     let mut child = Command::new(compiler)
-        .args([
-            "-pipe",
-            "-fPIC",
-            "-shared",
-            "-O2",
-            "-xc",
-            "-o/dev/fd/1",
-            "-",
-        ])
+        .args(["-pipe", "-fPIC", "-shared", "-O2", "-xc", "-o"])
+        .arg(&lib_path)
+        .arg("-")
         .args(args)
-        .env("TMPDIR", "/dev/shm") // best effort: asks the compiler to keep temp files off disk. not a guarantee
         .stdin(Stdio::from(src))
-        .stdout(Stdio::from(out_for_child))
+        .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(io_err("starting compiler"))?;
@@ -241,24 +271,18 @@ pub fn compile(source: &str, compiler: Option<&str>, args: &[&str]) -> Result<Li
         });
     }
 
-    // compiler is done: make the code immutable before running it
-    let seals = libc::F_SEAL_WRITE | libc::F_SEAL_GROW | libc::F_SEAL_SHRINK | libc::F_SEAL_SEAL;
-    // SAFETY: plain fcntl on a valid fd.
-    if unsafe { libc::fcntl(out.as_raw_fd(), libc::F_ADD_SEALS, seals) } == -1 {
-        return Err(Error::Io {
-            context: "sealing library",
-            source: io::Error::last_os_error(),
-        });
-    }
+    // hold the library's inode while it's loaded, so it can't be reused for a
+    // later library while this one is still loaded
+    let code = File::open(&lib_path).map_err(io_err("opening library"))?;
 
-    // the fd stays open as long as the library is loaded, so this path is unique
-    let path = CString::new(format!("/dev/fd/{}", out.as_raw_fd())).expect("no NUL in a number");
+    // random directory, so this path is unique
+    let path = path_to_cstring(&lib_path);
     // SAFETY: path is NUL terminated.
     let handle = unsafe { libc::dlopen(path.as_ptr(), libc::RTLD_NOW) };
     match NonNull::new(handle) {
         Some(handle) => Ok(Library {
             handle,
-            _code: out.into(),
+            _code: code.into(),
         }),
         None => {
             // SAFETY: dlerror returns NULL or a valid C string.

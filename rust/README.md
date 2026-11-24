@@ -1,6 +1,6 @@
 # c_aot_compile (Rust)
 
-Compile C source at runtime with the system C compiler, then load it. Linux only.
+Compile C source at runtime with the system C compiler, then load it. Linux and macOS.
 See the [top-level README](../README.md) for the design; API docs are in `src/lib.rs` (`cargo doc --open`).
 
 ```rust
@@ -10,7 +10,7 @@ let add = unsafe { lib.get::<extern "C" fn(i32, i32) -> i32>(c"add") }.unwrap();
 assert_eq!(add(1, 2), 3); // `add` borrows `lib`: using it after `lib` drops won't compile
 ```
 
-`Library` unloads on drop, and owns the memory file the code was loaded from.
+`Library` unloads on drop, and owns the (already deleted) file the code was loaded from.
 
 ```bash
 cargo run --example add

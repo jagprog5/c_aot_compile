@@ -43,8 +43,8 @@ int add(int a, int b) {return a + b;}";
 
     assert((*add_symbol)(1, 2) == 3);
 
-    // closes the library (dlclose) and the memory file it was loaded from.
-    // the memory file must stay open as long as the library is loaded
+    // closes the library (dlclose) and the file it was loaded from.
+    // the file must stay open as long as the library is loaded
     c_aot_compile_result_destroy(&result);
     puts("Ok!");
     return 0;

@@ -34,7 +34,8 @@ fn missing_compiler() {
 fn huge_input_with_dying_compiler_does_not_hang() {
     let big = "x".repeat(4 << 20);
     assert!(matches!(
-        compile(&big, Some("/bin/false"), &[]),
+        // via PATH: it's /bin/false on linux, /usr/bin/false on macos
+        compile(&big, Some("false"), &[]),
         Err(Error::Compiler { .. })
     ));
 }
