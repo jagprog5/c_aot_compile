@@ -7,6 +7,13 @@ const EXPORT: &str = if cfg!(windows) {
     ""
 };
 
+/// The compiler under test: `C_AOT_TEST_COMPILER`, else the library's default.
+fn cc() -> Option<&'static str> {
+    static CC: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    CC.get_or_init(|| std::env::var("C_AOT_TEST_COMPILER").ok().filter(|c| !c.is_empty()))
+        .as_deref()
+}
+
 /// C source defining `int f(void) { return <body> }`, exported.
 fn f_source(body: &str) -> String {
     format!("{EXPORT}int f(void) {{ return {body}; }}")
@@ -20,15 +27,15 @@ fn call_f(lib: &Library) -> i32 {
 
 #[test]
 fn two_libraries_loaded_at_once_do_not_alias() {
-    let a = compile(&f_source("1"), None, &[]).unwrap();
-    let b = compile(&f_source("2"), None, &[]).unwrap();
+    let a = compile(&f_source("1"), cc(), &[]).unwrap();
+    let b = compile(&f_source("2"), cc(), &[]).unwrap();
     assert_eq!(call_f(&a), 1);
     assert_eq!(call_f(&b), 2);
 }
 
 #[test]
 fn compile_error_carries_compiler_stderr() {
-    match compile(&format!("{EXPORT}int f(void){{ syntax error }}"), None, &[]) {
+    match compile(&format!("{EXPORT}int f(void){{ syntax error }}"), cc(), &[]) {
         Err(Error::Compiler { stderr, .. }) => assert!(stderr.contains("error"), "{stderr}"),
         other => panic!("{other:?}"),
     }
@@ -46,13 +53,13 @@ fn missing_compiler() {
 fn huge_input_with_dying_compiler_does_not_hang() {
     let big = "x".repeat(4 << 20);
     // exits at once without reading stdin: "false" via PATH (it's /bin/false on
-    // linux, /usr/bin/false on macos); on windows gcc with a bad flag
-    let (compiler, args): (&str, &[&str]) = if cfg!(windows) {
-        ("gcc", &["-fno-such-flag-xyz"])
+    // linux, /usr/bin/false on macos); on windows the compiler under test with a bad flag
+    let (compiler, args): (Option<&str>, &[&str]) = if cfg!(windows) {
+        (cc(), &["--no-such-flag-xyz"])
     } else {
-        ("false", &[])
+        (Some("false"), &[])
     };
-    match compile(&big, Some(compiler), args) {
+    match compile(&big, compiler, args) {
         Err(Error::Compiler { status, .. }) => assert!(status.contains('1'), "{status}"),
         other => panic!("{other:?}"),
     }
@@ -60,7 +67,7 @@ fn huge_input_with_dying_compiler_does_not_hang() {
 
 #[test]
 fn extra_args_are_passed() {
-    let lib = compile(&f_source("VALUE"), None, &["-DVALUE=7"]).unwrap();
+    let lib = compile(&f_source("VALUE"), cc(), &["-DVALUE=7"]).unwrap();
     assert_eq!(call_f(&lib), 7);
 }
 
@@ -69,7 +76,7 @@ fn works_from_many_threads() {
     let threads: Vec<_> = (0..8)
         .map(|i| {
             std::thread::spawn(move || {
-                call_f(&compile(&f_source(&i.to_string()), None, &[]).unwrap())
+                call_f(&compile(&f_source(&i.to_string()), cc(), &[]).unwrap())
             })
         })
         .collect();
@@ -80,21 +87,21 @@ fn works_from_many_threads() {
 
 #[test]
 fn missing_symbol_is_none() {
-    let lib = compile(&f_source("1"), None, &[]).unwrap();
+    let lib = compile(&f_source("1"), cc(), &[]).unwrap();
     assert!(unsafe { lib.get::<extern "C" fn()>(c"nope") }.is_none());
 }
 
 #[test]
 fn library_is_usable_after_other_libraries_drop() {
-    let a = compile(&f_source("1"), None, &[]).unwrap();
-    drop(compile(&f_source("2"), None, &[]).unwrap());
+    let a = compile(&f_source("1"), cc(), &[]).unwrap();
+    drop(compile(&f_source("2"), cc(), &[]).unwrap());
     assert_eq!(call_f(&a), 1);
 }
 
 #[test]
 fn compiler_output_is_not_captured_as_result() {
     // warnings go to stderr, but a successful compile is still ok
-    let lib = compile(&format!("{EXPORT}int f(void){{ int unused; return 3; }}"), None, &["-Wall"]).unwrap();
+    let lib = compile(&format!("{EXPORT}int f(void){{ int unused; return 3; }}"), cc(), &["-Wall"]).unwrap();
     assert_eq!(call_f(&lib), 3);
 }
 
@@ -103,14 +110,14 @@ fn source_with_non_ascii_and_large_size() {
     let mut src = f_source("4");
     src.push_str("\n/* héllo wörld */\n");
     src.push_str(&"/* padding */\n".repeat(200_000)); // ~2.8 MB
-    assert_eq!(call_f(&compile(&src, None, &[]).unwrap()), 4);
+    assert_eq!(call_f(&compile(&src, cc(), &[]).unwrap()), 4);
 }
 
 #[test]
 fn args_with_spaces_and_quotes_survive() {
     let lib = compile(
         &format!("{EXPORT}const char* f(void) {{ return MSG; }}"),
-        None,
+        cc(),
         &[r#"-DMSG="a b \"c\" d\\""#],
     )
     .unwrap();

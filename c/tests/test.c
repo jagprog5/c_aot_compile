@@ -14,8 +14,15 @@
 #define EXPORT ""
 #endif
 
+// the compiler under test: C_AOT_TEST_COMPILER, else the library's default
+static const char* test_compiler(void) {
+  const char* compiler = getenv("C_AOT_TEST_COMPILER");
+  return compiler && compiler[0] ? compiler : NULL;
+}
+
+// compiles with the compiler under test, unless one is given
 static struct c_aot_compile_result compile(const char* src, const char* compiler) {
-  return c_aot_compile(src, strlen(src), compiler, NULL);
+  return c_aot_compile(src, strlen(src), compiler ? compiler : test_compiler(), NULL);
 }
 
 static int call_f(struct c_aot_compile_result* r) {
@@ -86,9 +93,9 @@ static void test_dying_compiler_does_not_hang(void) {
   char* big = malloc(n);
   memset(big, 'x', n);
 #ifdef _WIN32
-  // gcc with a bad flag exits at once, without reading stdin
-  const char* const bad_args[] = {"-fno-such-flag-xyz", NULL};
-  struct c_aot_compile_result dead = c_aot_compile(big, n, "gcc", bad_args);
+  // a bad flag makes the compiler exit at once, without reading stdin
+  const char* const bad_args[] = {"--no-such-flag-xyz", NULL};
+  struct c_aot_compile_result dead = c_aot_compile(big, n, test_compiler(), bad_args);
 #else
   // "false" via PATH: it's /bin/false on linux, /usr/bin/false on macos
   struct c_aot_compile_result dead = c_aot_compile(big, n, "false", NULL);
@@ -103,7 +110,7 @@ static void test_source_need_not_be_nul_terminated(void) {
   // only the first source_size bytes count: here the rest would be a syntax error
   const char* both = EXPORT "int f(void){return 5;}" "@@ not c @@";
   size_t size = strlen(EXPORT "int f(void){return 5;}");
-  struct c_aot_compile_result r = c_aot_compile(both, size, NULL, NULL);
+  struct c_aot_compile_result r = c_aot_compile(both, size, test_compiler(), NULL);
   assert(r.type == C_AOT_COMPILE_OK);
   assert(call_f(&r) == 5);
   c_aot_compile_result_destroy(&r);
@@ -113,7 +120,7 @@ static void test_extra_args(void) {
   // spaces and quotes in an argument must survive the trip to the compiler
   const char* const args[] = {"-DVALUE=7", "-DMSG=\"a b \\\"c\\\" d\"", NULL};
   const char* src = EXPORT "int f(void){return VALUE;}\n" EXPORT "const char* g(void){return MSG;}";
-  struct c_aot_compile_result r = c_aot_compile(src, strlen(src), NULL, args);
+  struct c_aot_compile_result r = c_aot_compile(src, strlen(src), test_compiler(), args);
   assert(r.type == C_AOT_COMPILE_OK);
   assert(call_f(&r) == 7);
   const char* (*g)(void);
@@ -131,7 +138,7 @@ static void test_large_and_empty_source(void) {
   char* src = malloc(body_len + pad + 1);
   memcpy(src, body, body_len);
   memset(src + body_len, ' ', pad);
-  struct c_aot_compile_result r = c_aot_compile(src, body_len + pad, NULL, NULL);
+  struct c_aot_compile_result r = c_aot_compile(src, body_len + pad, test_compiler(), NULL);
   assert(r.type == C_AOT_COMPILE_OK);
   assert(call_f(&r) == 9);
   c_aot_compile_result_destroy(&r);

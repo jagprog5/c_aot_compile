@@ -6,12 +6,19 @@ on:
 
 jobs:
   test:
-    name: ${{ matrix.os }}
+    name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
+    env:
+      # the compiler the tests use; empty means the library's default
+      C_AOT_TEST_COMPILER: ${{ matrix.cc }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        include:
+          - {name: ubuntu, os: ubuntu-latest, cc: ""}
+          - {name: macos, os: macos-latest, cc: ""}
+          - {name: windows (mingw gcc), os: windows-latest, cc: gcc}
+          - {name: windows (clang), os: windows-latest, cc: clang}
     steps:
       - uses: actions/checkout@v4
 
@@ -25,15 +32,15 @@ jobs:
           cc -Wall -Wextra -Werror examples/add.c -ldl -o add
           ./add
 
-      - name: C header (windows, mingw gcc)
+      - name: C header (windows)
         if: runner.os == 'Windows'
         shell: bash
         working-directory: c
         run: |
-          gcc --version
-          gcc -Wall -Wextra -Werror tests/test.c -I. -o c_aot_test.exe
+          ${{ matrix.cc }} --version
+          ${{ matrix.cc }} -Wall -Wextra -Werror tests/test.c -I. -o c_aot_test.exe
           ./c_aot_test.exe
-          gcc -Wall -Wextra -Werror examples/add.c -o add.exe
+          ${{ matrix.cc }} -Wall -Wextra -Werror examples/add.c -o add.exe
           ./add.exe
 
       - name: Rust crate
