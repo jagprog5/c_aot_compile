@@ -28,14 +28,16 @@
 //! [`fast_candidates`] puts the fastest generated code first (the system
 //! compilers with `-O2 -march=native ...`, libtcc after them), and
 //! [`memory_first_candidates`] avoids writing to disk first and then speed.
-//! Both take the path of a libtcc you ship, or `None`, and put it where it
-//! belongs: this crate never looks for one. [`Compiler::resolve_fast`] and
+//! Both take the path of an optional libtcc you bundle with your app, or
+//! `None`, and put it where it belongs ([`memory_first_candidates`] also tries
+//! the system's after it). [`Compiler::resolve_fast`] and
 //! [`Compiler::resolve_memory_first`] resolve them.
 //! An executable or environment variable candidate can carry its own compiler
 //! args ([`Candidate::executable_with_args`]), which come after the fixed ones.
 //! A tcc library has no args: it
-//! takes a configure function ([`Candidate::tcc_library_with`]) instead, called
-//! with every new tcc state, to set options on it directly.
+//! takes a configure function ([`Candidate::tcc_library_with`]) instead, to
+//! set options on the tcc state directly. Every compile gets a fresh tcc
+//! state, so it runs before every compile, not once.
 //!
 //! # libtcc
 //! A [`Candidate::TccLibrary`] is a libtcc shared object you provide (build it
@@ -512,8 +514,9 @@ pub enum Candidate {
     /// then happens in this process, to memory, with no files or child
     /// process.
     ///
-    /// A tcc library has no args: `configure` is called with every new tcc
-    /// state instead, to set options on it directly.
+    /// A tcc library has no args: `configure` sets options on the tcc state
+    /// directly instead. Every compile gets a fresh tcc state, so it runs
+    /// before every compile, not once.
     TccLibrary {
         library: PathBuf,
         configure: Option<TccConfigure>,
@@ -538,8 +541,10 @@ impl Candidate {
         Candidate::TccLibrary { library: library.into(), configure: None }
     }
 
-    /// A libtcc shared object whose every new tcc state is passed to
-    /// `configure`, to set options on it directly. See [`TccConfigure`].
+    /// A libtcc shared object with a `configure` function, which sets options
+    /// on the tcc state directly. It runs before every single compile (each
+    /// gets a fresh tcc state), including the test compile when resolving,
+    /// not once. See [`TccConfigure`].
     pub fn tcc_library_with(
         library: impl Into<PathBuf>,
         configure: impl Fn(&TccState<'_>) -> Result<(), String> + Send + Sync + 'static,
@@ -574,10 +579,10 @@ impl Candidate {
 /// libtcc, and on Linux the compilers below, whose source and library are
 /// memory files and whose own temporary files go to `/dev/shm`. The order:
 /// - **Linux:** `$CC`, then `cc`, `gcc`, `clang` (their source and library are
-///   memory files: nothing touches disk), then your libtcc as the fallback,
-///   then `tcc` as a program, last.
-/// - **Elsewhere** (macOS, Windows, other Unix): your libtcc first (the only
-///   option that never touches disk there), then `tcc` as a program (it
+///   memory files: nothing touches disk), then your bundled libtcc and the system's
+///   as the fallback, then `tcc` as a program, last.
+/// - **Elsewhere** (macOS, Windows, other Unix): your bundled libtcc and the
+///   system's first (the only option that never touches disk there), then `tcc` as a program (it
 ///   compiles fastest), then `$CC`, then `cc`, `gcc`, `clang` (Windows: `gcc`,
 ///   `clang`, `cc`).
 /// - **Linux with the `no_memory_files` feature:** as "elsewhere", except that
@@ -592,11 +597,16 @@ impl Candidate {
 /// at the end of the list. libtcc, in process, has no such problem. See the
 /// README.
 ///
-/// `tcc_library` is a libtcc you ship (a path, or a bare name for the system
-/// loader), or `None` for none. This crate never looks for one: you provide it.
-pub fn memory_first_candidates(tcc_library: Option<&Path>) -> Vec<Candidate> {
+/// `bundled_tcc_library` is optional: a libtcc you bundle with your app (a
+/// path, or a bare name for the system loader), or `None` for none. "The system's" libtcc is an installed one,
+/// found by the loader; it is skipped if there is none.
+pub fn memory_first_candidates(bundled_tcc_library: Option<&Path>) -> Vec<Candidate> {
     const MEMORY_FILES: bool = cfg!(all(target_os = "linux", not(feature = "no_memory_files")));
-    let tcc_library = tcc_library.map(Candidate::tcc_library);
+    let tcc_libraries: Vec<Candidate> = bundled_tcc_library
+        .into_iter()
+        .chain([Path::new(SYSTEM_TCC_LIBRARY)])
+        .map(Candidate::tcc_library)
+        .collect();
     let programs = sys::SYSTEM_COMPILERS.iter().map(|n| Candidate::executable(*n));
 
     let tcc_program = Candidate::executable("tcc");
@@ -607,10 +617,10 @@ pub fn memory_first_candidates(tcc_library: Option<&Path>) -> Vec<Candidate> {
         // the system compilers keep nothing on disk: they come first
         list.push(Candidate::env("CC"));
         list.extend(programs);
-        list.extend(tcc_library);
+        list.extend(tcc_libraries);
     } else {
         // only libtcc keeps nothing on disk: it comes first
-        list.extend(tcc_library);
+        list.extend(tcc_libraries);
         if !tcc_last {
             list.push(tcc_program.clone());
         }
@@ -623,13 +633,22 @@ pub fn memory_first_candidates(tcc_library: Option<&Path>) -> Vec<Candidate> {
     list
 }
 
+// the system's libtcc, as a bare name for the loader: an installed tcc's
+const SYSTEM_TCC_LIBRARY: &str = if cfg!(windows) {
+    "libtcc.dll"
+} else if cfg!(target_vendor = "apple") {
+    "libtcc.dylib"
+} else {
+    "libtcc.so"
+};
+
 /// The "go fast" compiler args of [`fast_candidates`].
 pub const FAST_ARGS: &[&str] = &["-O2", "-march=native", "-fno-semantic-interposition"];
 
 /// The fast preset: the candidates to try when you want the fastest generated
 /// code, whatever it costs. The system compilers, each first with "go fast" args ([`FAST_ARGS`]),
 /// and then without them if it turns out to reject them: `$CC`, then `cc`,
-/// `gcc`, `clang` (Windows: `gcc`, `clang`, `cc`). Then your libtcc, and then
+/// `gcc`, `clang` (Windows: `gcc`, `clang`, `cc`). Then your bundled libtcc, and then
 /// `tcc` as a program, last: tcc doesn't optimize (and on Linux, its libraries
 /// may not load: see [`memory_first_candidates`]).
 ///
@@ -641,14 +660,15 @@ pub const FAST_ARGS: &[&str] = &["-O2", "-march=native", "-fno-semantic-interpos
 /// [`Candidate::executable_with_args`] if you want them. Compiling takes
 /// longer.
 ///
-/// `tcc_library` is a libtcc you ship, or `None` for none.
-pub fn fast_candidates(tcc_library: Option<&Path>) -> Vec<Candidate> {
+/// `bundled_tcc_library` is optional: a libtcc you bundle with your app, or
+/// `None` for none.
+pub fn fast_candidates(bundled_tcc_library: Option<&Path>) -> Vec<Candidate> {
     let mut list = vec![Candidate::env_with_args("CC", FAST_ARGS.iter().copied()), Candidate::env("CC")];
     for name in sys::SYSTEM_COMPILERS {
         list.push(Candidate::executable_with_args(*name, FAST_ARGS.iter().copied()));
         list.push(Candidate::executable(*name));
     }
-    list.extend(tcc_library.map(Candidate::tcc_library));
+    list.extend(bundled_tcc_library.map(Candidate::tcc_library));
     list.push(Candidate::executable("tcc"));
     list
 }
@@ -726,15 +746,17 @@ impl Compiler {
     }
 
     /// [`Compiler::resolve`] with [`fast_candidates`]: the fastest generated
-    /// code. `tcc_library` is a libtcc you ship, or `None`.
-    pub fn resolve_fast(tcc_library: Option<&Path>) -> Result<Compiler, ResolveError> {
-        Compiler::resolve(&fast_candidates(tcc_library))
+    /// code. `bundled_tcc_library` is optional: a libtcc you bundle with your
+    /// app, or `None`.
+    pub fn resolve_fast(bundled_tcc_library: Option<&Path>) -> Result<Compiler, ResolveError> {
+        Compiler::resolve(&fast_candidates(bundled_tcc_library))
     }
 
-    /// [`Compiler::resolve`] with [`memory_first_candidates`]. `tcc_library` is a
-    /// libtcc you ship, or `None`.
-    pub fn resolve_memory_first(tcc_library: Option<&Path>) -> Result<Compiler, ResolveError> {
-        Compiler::resolve(&memory_first_candidates(tcc_library))
+    /// [`Compiler::resolve`] with [`memory_first_candidates`].
+    /// `bundled_tcc_library` is optional: a libtcc you bundle with your app, or
+    /// `None`.
+    pub fn resolve_memory_first(bundled_tcc_library: Option<&Path>) -> Result<Compiler, ResolveError> {
+        Compiler::resolve(&memory_first_candidates(bundled_tcc_library))
     }
 
     /// The index of the candidate that was chosen.
@@ -934,8 +956,9 @@ pub struct TccState<'a> {
     pub api: &'a TccApi,
 }
 
-/// A function called with every new tcc state, before the source is compiled,
-/// to set options on it directly (through [`TccState::api`]). Return `Ok` to
+/// A function called before every single compile, not once: each compile
+/// gets a fresh tcc state, and this sets options on it directly (through
+/// [`TccState::api`]) before the source is compiled. Return `Ok` to
 /// carry on and compile the source, or `Err` to stop before it is compiled
 /// (the compile then returns an error saying so). It runs for the test program
 /// when resolving too, and

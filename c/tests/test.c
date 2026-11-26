@@ -166,40 +166,57 @@ static bool is_tcc_program(const struct c_aot_candidate* c) {
   return c->type == C_AOT_CANDIDATE_EXECUTABLE && strcmp(named(c), "tcc") == 0;
 }
 
+// true if the candidate is the system's libtcc
+static bool is_system_tcc_library(const struct c_aot_candidate* c) {
+#if defined(_WIN32)
+  const char* system_tcc = "libtcc.dll";
+#elif defined(__APPLE__)
+  const char* system_tcc = "libtcc.dylib";
+#else
+  const char* system_tcc = "libtcc.so";
+#endif
+  return c->type == C_AOT_CANDIDATE_TCC_LIBRARY && strcmp(named(c), system_tcc) == 0;
+}
+
 static void test_memory_first_candidates_order(void) {
   struct c_aot_candidate list[C_AOT_PRESET_CANDIDATES_MAX];
-  bool cc_first_without = false, cc_first_with = false;
 
-  // without a libtcc there is none in the list, anywhere
+  // without your libtcc, the system's is the only one
   size_t n = c_aot_memory_first_candidates(list, NULL);
-  for (size_t i = 0; i < n; ++i) assert(list[i].type != C_AOT_CANDIDATE_TCC_LIBRARY);
-  cc_first_without = list[0].type == C_AOT_CANDIDATE_ENV && strcmp(named(&list[0]), "CC") == 0;
+  size_t system_at = n;
+  for (size_t i = 0; i < n; ++i) {
+    if (list[i].type == C_AOT_CANDIDATE_TCC_LIBRARY) {
+      assert(system_at == n && is_system_tcc_library(&list[i]));
+      system_at = i;
+    }
+  }
+  assert(system_at < n);
 
   size_t with = c_aot_memory_first_candidates(list, "/some/libtcc.so");
   assert(with == n + 1);
-  cc_first_with = list[0].type == C_AOT_CANDIDATE_ENV && strcmp(named(&list[0]), "CC") == 0;
+  // yours, then the system's right after it, wherever they go
+  assert(list[system_at].type == C_AOT_CANDIDATE_TCC_LIBRARY && strcmp(named(&list[system_at]), "/some/libtcc.so") == 0);
+  assert(is_system_tcc_library(&list[system_at + 1]));
+  bool cc_first_with = list[0].type == C_AOT_CANDIDATE_ENV && strcmp(named(&list[0]), "CC") == 0;
 #ifdef C_AOT_MEMORY_FILES
   // memory files: the system compilers keep nothing on disk, so $CC and they
-  // come first, then libtcc, then tcc as a program, last
-  assert(cc_first_without && cc_first_with);
-  assert(list[with - 2].type == C_AOT_CANDIDATE_TCC_LIBRARY && strcmp(named(&list[with - 2]), "/some/libtcc.so") == 0);
+  // come first, then the libtccs, then tcc as a program, last
+  assert(cc_first_with);
+  assert(system_at + 2 == with - 1);
   assert(is_tcc_program(&list[with - 1]));
 #else
-  // no memory files: libtcc keeps nothing on disk, so it comes first, before $CC
-  assert(!cc_first_with);
-  assert(list[0].type == C_AOT_CANDIDATE_TCC_LIBRARY && strcmp(named(&list[0]), "/some/libtcc.so") == 0);
+  // no memory files: libtcc keeps nothing on disk, so they come first, before $CC
+  assert(!cc_first_with && system_at == 0);
 #ifdef __linux__
   // tcc as a program stays last on linux (its libraries may not load there)
-  assert(cc_first_without);
   assert(is_tcc_program(&list[with - 1]));
-  assert(list[1].type == C_AOT_CANDIDATE_ENV);
+  assert(list[2].type == C_AOT_CANDIDATE_ENV);
 #else
-  // elsewhere: tcc as a program right after libtcc (it compiles fastest), then $CC
-  assert(!cc_first_without);
-  assert(is_tcc_program(&list[1]));
-  assert(list[2].type == C_AOT_CANDIDATE_ENV && strcmp(named(&list[2]), "CC") == 0);
+  // elsewhere: tcc as a program right after the libtccs (it compiles fastest), then $CC
+  assert(is_tcc_program(&list[2]));
+  assert(list[3].type == C_AOT_CANDIDATE_ENV && strcmp(named(&list[3]), "CC") == 0);
   c_aot_memory_first_candidates(list, NULL);
-  assert(is_tcc_program(&list[0]) && list[1].type == C_AOT_CANDIDATE_ENV);
+  assert(is_system_tcc_library(&list[0]) && is_tcc_program(&list[1]) && list[2].type == C_AOT_CANDIDATE_ENV);
 #endif
 #endif
   // tcc as a program is in the list exactly once, wherever it is
@@ -304,9 +321,9 @@ static void test_resolution_falls_through(void) {
   for (size_t i = 0; i < count; ++i) list[2 + i] = preset[i];
   struct c_aot_resolve_result c = c_aot_compiler_resolve(list, 2 + count);
   assert(c.type == C_AOT_RESOLVE_OK);
-  assert(c.value.compiler.type == C_AOT_COMPILER_EXECUTABLE);
   assert(c.value.compiler.candidate >= 2);
-  assert(c.value.compiler.value.executable.path && c.value.compiler.value.executable.path[0]);
+  // the system's libtcc may win, if it is installed
+  assert(c.value.compiler.type == C_AOT_COMPILER_TCC || (c.value.compiler.value.executable.path && c.value.compiler.value.executable.path[0]));
   c_aot_resolve_result_destroy(&c);
 
   // C_AOT_TEST_COMPILER can be a relative path too: made absolute
@@ -437,7 +454,7 @@ static void test_tcc(void) {
   size_t preset_count = c_aot_memory_first_candidates(preset, library);
   int tcc_entries = 0;
   for (size_t i = 0; i < preset_count; ++i) {
-    if (preset[i].type == C_AOT_CANDIDATE_TCC_LIBRARY) {
+    if (preset[i].type == C_AOT_CANDIDATE_TCC_LIBRARY && strcmp(named(&preset[i]), library) == 0) {
       assert(preset[i].value.tcc_library.configure == NULL);
       preset[i].value.tcc_library.configure = configure_defines;
       preset[i].value.tcc_library.user_data = &log;
@@ -686,13 +703,18 @@ static void test_temp_dir_cleanup(void) {
 }
 
 int main(void) {
-  // C_AOT_TEST_COMPILER first (skipped when unset), then the preset
+  // C_AOT_TEST_COMPILER first (skipped when unset), then the preset's
+  // programs: these tests are for one (libtcc has its own, and the system's
+  // may be installed)
   struct c_aot_candidate preset[C_AOT_PRESET_CANDIDATES_MAX];
   size_t count = c_aot_memory_first_candidates(preset, NULL);
   struct c_aot_candidate list[C_AOT_PRESET_CANDIDATES_MAX + 1];
-  list[0] = c_aot_candidate_env("C_AOT_TEST_COMPILER", NULL);
-  for (size_t i = 0; i < count; ++i) list[1 + i] = preset[i];
-  g_resolved = c_aot_compiler_resolve(list, 1 + count);
+  size_t listed = 0;
+  list[listed++] = c_aot_candidate_env("C_AOT_TEST_COMPILER", NULL);
+  for (size_t i = 0; i < count; ++i) {
+    if (preset[i].type != C_AOT_CANDIDATE_TCC_LIBRARY) list[listed++] = preset[i];
+  }
+  g_resolved = c_aot_compiler_resolve(list, listed);
   if (g_resolved.type == C_AOT_RESOLVE_ERR) {
     fputs(g_resolved.value.error_msg ? g_resolved.value.error_msg : "?", stderr);
   }

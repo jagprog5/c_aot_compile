@@ -8,12 +8,14 @@ const EXPORT: &str = if cfg!(windows) {
 };
 
 /// The compiler under test, resolved once: `C_AOT_TEST_COMPILER` (a name or
-/// path; skipped when unset or empty), else the memory first preset.
+/// path; skipped when unset or empty), else the memory first preset's
+/// programs: these tests are for one (libtcc has its own, and the system's may
+/// be installed).
 fn compiler() -> &'static Compiler {
     static COMPILER: std::sync::OnceLock<Compiler> = std::sync::OnceLock::new();
     COMPILER.get_or_init(|| {
         let mut candidates = vec![Candidate::env("C_AOT_TEST_COMPILER")];
-        candidates.extend(memory_first_candidates(None));
+        candidates.extend(memory_first_candidates(None).into_iter().filter(|c| !matches!(c, Candidate::TccLibrary { .. })));
         Compiler::resolve(&candidates).unwrap_or_else(|e| panic!("{e}"))
     })
 }
@@ -82,8 +84,8 @@ fn resolution_falls_through_to_a_working_candidate() {
     candidates.extend(memory_first_candidates(None));
     let c = Compiler::resolve(&candidates).unwrap();
     assert!(c.candidate() >= 1);
-    assert_eq!(c.kind(), CompilerKind::Executable);
-    assert!(c.path().is_absolute());
+    // the system's libtcc may win, if it is installed
+    assert!(c.kind() == CompilerKind::Tcc || c.path().is_absolute());
 }
 
 #[test]
@@ -281,32 +283,45 @@ fn memory_first_candidates_order() {
     let tcc = Candidate::tcc_library("/some/libtcc.so");
     let on_linux = cfg!(target_os = "linux");
 
-    // without a libtcc there is none in the list, anywhere
+    let system = Candidate::tcc_library(if cfg!(windows) {
+        "libtcc.dll"
+    } else if cfg!(target_vendor = "apple") {
+        "libtcc.dylib"
+    } else {
+        "libtcc.so"
+    });
+
+    // without your libtcc, the system's is the only one
     let none = memory_first_candidates(None);
-    assert!(none.iter().all(|c| !matches!(c, Candidate::TccLibrary { .. })), "no libtcc unless you give one");
+    let libtccs: Vec<usize> = (0..none.len()).filter(|&i| matches!(none[i], Candidate::TccLibrary { .. })).collect();
+    assert_eq!(libtccs.len(), 1);
+    let at = libtccs[0];
+    assert_eq!(none[at], system);
+    // yours, then the system's right after it, wherever they go
     let with = memory_first_candidates(Some(Path::new("/some/libtcc.so")));
     assert_eq!(with.len(), none.len() + 1);
+    assert_eq!((&with[at], &with[at + 1]), (&tcc, &system));
 
     if cfg!(all(target_os = "linux", not(feature = "no_memory_files"))) {
         // memory files: the system compilers keep nothing on disk, so $CC and
-        // they come first, then libtcc, then tcc as a program, last
+        // they come first, then the libtccs, then tcc as a program, last
         assert_eq!(none[0], cc);
         assert_eq!(with[0], cc);
-        assert_eq!(with[with.len() - 2], tcc);
+        assert_eq!(at + 2, with.len() - 1);
         assert_eq!(with.last(), Some(&tcc_program));
     } else {
-        // no memory files: libtcc keeps nothing on disk, so it comes first, before $CC
-        assert_eq!(with[0], tcc);
+        // no memory files: libtcc keeps nothing on disk, so they come first, before $CC
+        assert_eq!(at, 0);
         if on_linux {
             // tcc as a program stays last on Linux (its libraries may not load there)
-            assert_eq!(with[1], cc);
-            assert_eq!(none[0], cc);
+            assert_eq!(with[2], cc);
+            assert_eq!(none[1], cc);
             assert_eq!(with.last(), Some(&tcc_program));
         } else {
-            // elsewhere: tcc as a program right after libtcc (it compiles fastest), then $CC
-            assert_eq!(with[1], tcc_program);
-            assert_eq!(with[2], cc);
-            assert_eq!((&none[0], &none[1]), (&tcc_program, &cc));
+            // elsewhere: tcc as a program right after the libtccs (it compiles fastest), then $CC
+            assert_eq!(with[2], tcc_program);
+            assert_eq!(with[3], cc);
+            assert_eq!((&none[1], &none[2]), (&tcc_program, &cc));
         }
     }
     // tcc as a program is in the list exactly once, wherever it is

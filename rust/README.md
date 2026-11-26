@@ -38,7 +38,7 @@ cargo run --example add   # prints "Ok!"
 
 ## Choosing the compiler
 
-The presets are one call each. Pass the path of a libtcc you ship, or `None`:
+The presets are one call each. Pass the path of an optional libtcc you bundle with your app, or `None`:
 
 ```rust
 use std::path::Path;
@@ -66,8 +66,8 @@ resolving.
 
 ### Configuring tcc
 
-A tcc library has no args. It takes a closure instead, called with each new tcc instance before your source is
-compiled, so you can set it up directly with libtcc's own functions:
+A tcc library has no args. It takes a closure instead, which sets up the tcc state directly with libtcc's own
+functions. Every compile gets a fresh tcc state, so the closure runs before every single compile, not once:
 
 ```rust
 let tcc = Candidate::tcc_library_with("/opt/myapp/tcc/libtcc.so", |tcc| {

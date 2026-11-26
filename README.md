@@ -23,12 +23,12 @@ It's [not a new idea](https://forums.raspberrypi.com/viewtopic.php?t=319919#p196
 What it promises:
 
 1. **C text in, callable code out**, at the quality of the compiler that built it.
-2. **Works wherever there is a compiler.** Where there isn't, it falls back to a bundled libtcc if you ship one, or
-   otherwise reports clearly what was tried.
-3. **Safe by default.** It doesn't hang on a misbehaving compiler, doesn't truncate input, never loads the wrong code,
-   and can be used from several threads.
-4. **Leaves nothing behind.** It keeps files in memory where the system allows, and removes temporary files otherwise.
-5. **One design** for C and Rust, on Linux, macOS and Windows.
+2. **Finds the right compiler for you.** Say what you prefer, the fastest code or no writes to disk, and it works out
+   which compiler on this machine best gives you that: it tries the candidates in that order and test-compiles each,
+   so the one you get is known to work. Where there is no compiler, it falls back to a bundled libtcc if you ship one,
+   or otherwise reports clearly what was tried.
+3. **Leaves nothing behind.** It keeps files in memory where the system allows, and removes temporary files otherwise.
+4. **One design** for C and Rust, on Linux, macOS and Windows.
 
 
 ## Example
@@ -93,8 +93,9 @@ The list is yours to configure. Two ready-made ones, the presets, cover the usua
   used if it is the only one.
 
 Both take an optional libtcc. If you bundle one as a fallback for systems with no compiler at all (see
-[below](#no-compiler-on-the-system-bundle-libtcc)), pass its path, otherwise `NULL` (`None` in Rust). The exact orders
-are documented in the header and the crate docs.
+[below](#no-compiler-on-the-system-bundle-libtcc)), pass its path, otherwise `NULL` (`None` in Rust). The memory first
+preset also tries the system's libtcc (`libtcc.so`, `libtcc.dylib` or `libtcc.dll`, wherever the loader finds it) right
+after yours, if one is installed. The exact orders are documented in the header and the crate docs.
 
 ### Your own list
 

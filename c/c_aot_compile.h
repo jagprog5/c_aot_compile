@@ -165,8 +165,9 @@ struct c_aot_tcc_api {
   int (*tcc_add_file)(void*, const char*);
 };
 
-// called with every new tcc state, before the source is compiled: to set
-// options on it directly (analogous to CLI args for the executable candidates,
+// called before every single compile, not once: each compile gets a fresh
+// tcc state, and this sets options on it directly, before the source is
+// compiled (analogous to CLI args for the executable candidates,
 // but for the lib instead). tcc_state is the non-NULL result of tcc_new(). it
 // has its error function, support directory and memory output already set.
 // return 0 to carry on and compile the source, or nonzero to stop before it is
@@ -1692,10 +1693,10 @@ enum { C_AOT_PRESET_CANDIDATES_MAX = 12 };
 // library are memory files and whose own temporary files go to /dev/shm. the
 // order:
 // - linux: $CC, then cc, gcc, clang (their source and library are memory
-//   files: nothing touches disk), then your libtcc as the fallback, then tcc as
-//   a program, last.
-// - elsewhere (macos, windows, other unix): your libtcc first (the only option
-//   that never touches disk there), then tcc as a program (it compiles
+//   files: nothing touches disk), then your bundled libtcc and the system's as the
+//   fallback, then tcc as a program, last.
+// - elsewhere (macos, windows, other unix): your bundled libtcc and the system's first
+//   (the only option that never touches disk there), then tcc as a program (it compiles
 //   fastest), then $CC, then cc, gcc, clang (windows: gcc, clang, cc).
 // - with C_AOT_NO_MEMORY_FILES on linux: as "elsewhere", except that tcc as a
 //   program stays last, as on linux.
@@ -1706,15 +1707,21 @@ enum { C_AOT_PRESET_CANDIDATES_MAX = 12 };
 // older, and where it isn't, resolving fails it with the loader's own message
 // and moves on, so it costs nothing but a test compile at the end of the list.
 // libtcc, in process, has no such problem. see the README
-// tcc_library: a libtcc you ship (a path, or a bare name for the loader), or
-// NULL for none. this lib never looks for one: you provide it. to give it a
-// configure function, set value.tcc_library.configure of the candidate of type
+// bundled_tcc_library: optional, a libtcc you bundle with your app (a path, or
+// a bare name for the loader), or NULL for none. "the system's" libtcc is an installed one, found by the
+// loader; it is skipped if there is none. to give a libtcc a configure
+// function, set value.tcc_library.configure of the candidates of type
 // C_AOT_CANDIDATE_TCC_LIBRARY in out afterwards
-static inline size_t c_aot_memory_first_candidates(struct c_aot_candidate* out, const char* tcc_library) {
+static inline size_t c_aot_memory_first_candidates(struct c_aot_candidate* out, const char* bundled_tcc_library) {
 #ifdef _WIN32
   static const char* const names[] = {"gcc", "clang", "cc"};
+  static const char system_tcc[] = "libtcc.dll";
+#elif defined(__APPLE__)
+  static const char* const names[] = {"cc", "gcc", "clang"};
+  static const char system_tcc[] = "libtcc.dylib";
 #else
   static const char* const names[] = {"cc", "gcc", "clang"};
+  static const char system_tcc[] = "libtcc.so";
 #endif
   size_t n = 0;
 #ifdef C_AOT_MEMORY_FILES
@@ -1723,14 +1730,16 @@ static inline size_t c_aot_memory_first_candidates(struct c_aot_candidate* out, 
   for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); ++i) {
     out[n++] = c_aot_candidate_executable(names[i], NULL);
   }
-  if (tcc_library) {
-    out[n++] = c_aot_candidate_tcc_library(tcc_library, NULL, NULL);
+  if (bundled_tcc_library) {
+    out[n++] = c_aot_candidate_tcc_library(bundled_tcc_library, NULL, NULL);
   }
+  out[n++] = c_aot_candidate_tcc_library(system_tcc, NULL, NULL);
 #else
   // only libtcc keeps nothing on disk: it comes first
-  if (tcc_library) {
-    out[n++] = c_aot_candidate_tcc_library(tcc_library, NULL, NULL);
+  if (bundled_tcc_library) {
+    out[n++] = c_aot_candidate_tcc_library(bundled_tcc_library, NULL, NULL);
   }
+  out[n++] = c_aot_candidate_tcc_library(system_tcc, NULL, NULL);
 #ifndef __linux__
   out[n++] = c_aot_candidate_executable("tcc", NULL);
 #endif
@@ -1896,7 +1905,7 @@ static inline struct c_aot_resolve_result c_aot_compiler_resolve(const struct c_
 // code, whatever it costs. writes them to out (room for C_AOT_PRESET_CANDIDATES_MAX) and returns
 // how many. the system compilers, each first with "go fast" args, and then
 // without them if it turns out to reject them: $CC, then cc, gcc, clang
-// (windows: gcc, clang, cc). then your libtcc, and then tcc as a program, last:
+// (windows: gcc, clang, cc). then your bundled libtcc, and then tcc as a program, last:
 // tcc doesn't optimize (and on linux, its libraries may not load: see
 // c_aot_memory_first_candidates). the args are -O2 (over the default -O1),
 // -march=native (this machine's instructions; the code is built here and runs
@@ -1904,8 +1913,8 @@ static inline struct c_aot_resolve_result c_aot_compiler_resolve(const struct c_
 // not included, because they change what a program means or remove protection:
 // -ffast-math, -DNDEBUG, -fno-stack-protector. add them with
 // a candidate's args if you want them. compiling takes longer.
-// tcc_library: a libtcc you ship, or NULL for none
-static inline size_t c_aot_fast_candidates(struct c_aot_candidate* out, const char* tcc_library) {
+// bundled_tcc_library: optional, a libtcc you bundle with your app, or NULL for none
+static inline size_t c_aot_fast_candidates(struct c_aot_candidate* out, const char* bundled_tcc_library) {
   static const char* const fast[] = {"-O2", "-march=native", "-fno-semantic-interposition", NULL};
 #ifdef _WIN32
   static const char* const names[] = {"gcc", "clang", "cc"};
@@ -1919,26 +1928,26 @@ static inline size_t c_aot_fast_candidates(struct c_aot_candidate* out, const ch
     out[n++] = c_aot_candidate_executable(names[i], fast);
     out[n++] = c_aot_candidate_executable(names[i], NULL);
   }
-  if (tcc_library) {
-    out[n++] = c_aot_candidate_tcc_library(tcc_library, NULL, NULL);
+  if (bundled_tcc_library) {
+    out[n++] = c_aot_candidate_tcc_library(bundled_tcc_library, NULL, NULL);
   }
   out[n++] = c_aot_candidate_executable("tcc", NULL);
   return n;
 }
 
-// c_aot_compiler_resolve with c_aot_fast_candidates. tcc_library: a libtcc you
-// ship, or NULL
-static inline struct c_aot_resolve_result c_aot_compiler_resolve_fast(const char* tcc_library) {
+// c_aot_compiler_resolve with c_aot_fast_candidates. bundled_tcc_library:
+// optional, a libtcc you bundle with your app, or NULL
+static inline struct c_aot_resolve_result c_aot_compiler_resolve_fast(const char* bundled_tcc_library) {
   struct c_aot_candidate candidates[C_AOT_PRESET_CANDIDATES_MAX];
-  size_t count = c_aot_fast_candidates(candidates, tcc_library);
+  size_t count = c_aot_fast_candidates(candidates, bundled_tcc_library);
   return c_aot_compiler_resolve(candidates, count);
 }
 
-// c_aot_compiler_resolve with c_aot_memory_first_candidates. tcc_library: a libtcc
-// you ship, or NULL
-static inline struct c_aot_resolve_result c_aot_compiler_resolve_memory_first(const char* tcc_library) {
+// c_aot_compiler_resolve with c_aot_memory_first_candidates.
+// bundled_tcc_library: optional, a libtcc you bundle with your app, or NULL
+static inline struct c_aot_resolve_result c_aot_compiler_resolve_memory_first(const char* bundled_tcc_library) {
   struct c_aot_candidate candidates[C_AOT_PRESET_CANDIDATES_MAX];
-  size_t count = c_aot_memory_first_candidates(candidates, tcc_library);
+  size_t count = c_aot_memory_first_candidates(candidates, bundled_tcc_library);
   return c_aot_compiler_resolve(candidates, count);
 }
 

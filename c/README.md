@@ -53,7 +53,7 @@ cc examples/add.c -ldl -lpthread -o /tmp/add && /tmp/add   # prints "Ok!"
 
 ## Choosing the compiler
 
-The presets are one call each. Pass the path of a libtcc you ship, or `NULL`:
+The presets are one call each. Pass the path of an optional libtcc you bundle with your app, or `NULL`:
 
 ```c
 struct c_aot_resolve_result fast = c_aot_compiler_resolve_fast("/opt/myapp/tcc/libtcc.so");
@@ -79,8 +79,8 @@ want to change it before resolving. Give the array room for `C_AOT_PRESET_CANDID
 
 ### Configuring tcc
 
-A tcc library has no args. It takes a function instead, called with each new tcc instance before your source is
-compiled, so you can set it up directly with libtcc's own functions:
+A tcc library has no args. It takes a function instead, which sets up the tcc state directly with libtcc's own
+functions. Every compile gets a fresh tcc state, so the function runs before every single compile, not once:
 
 ```c
 static int configure(void* tcc, const struct c_aot_tcc_api* api, void* user_data) {

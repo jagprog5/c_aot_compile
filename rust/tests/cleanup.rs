@@ -5,7 +5,8 @@ use c_aot_compile::{memory_first_candidates, Candidate, Compiler};
 
 fn compiler() -> Compiler {
     let mut candidates = vec![Candidate::env("C_AOT_TEST_COMPILER")];
-    candidates.extend(memory_first_candidates(None));
+    // the preset's programs: this test is about their temp directory
+    candidates.extend(memory_first_candidates(None).into_iter().filter(|c| !matches!(c, Candidate::TccLibrary { .. })));
     Compiler::resolve(&candidates).unwrap_or_else(|e| panic!("{e}"))
 }
 
