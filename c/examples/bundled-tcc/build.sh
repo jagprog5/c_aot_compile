@@ -9,23 +9,33 @@
 # win32/build-tcc.bat and bundles libtcc.dll the same way, without the app.
 set -eu
 
-# a tcc commit that this header's libtcc binding was tested with
+# a tcc commit that this header's libtcc binding was tested with (from
+# mob@772dc70d on, tcc as a program also works on glibc 2.41 and later)
 TCC_URL=https://repo.or.cz/tinycc.git
 # override to test another version, e.g. TCC_COMMIT=release_0_9_27 ./build.sh
-TCC_COMMIT=${TCC_COMMIT:-857cbeb04bd876c699cbb4a7b9ec37d1300ad9d5}
+TCC_COMMIT=${TCC_COMMIT:-772dc70df00f53461c526dddca42b63d1b7148c7}
 
 here=$(cd "$(dirname "$0")" && pwd)
 src="$here/build/tinycc"
 dist="$here/dist"
 
-# 1. get tcc's source, at exactly that commit
+# 1. get tcc's source, at exactly that commit. the server only hands out a
+#    commit by hash while it is a branch tip, so fetch the branches and tags
+#    whole (no --depth: an older pinned commit is then always in them), and
+#    check the commit out from there
 if [ ! -d "$src/.git" ]; then
   mkdir -p "$src"
   git -C "$src" init -q
   git -C "$src" remote add origin "$TCC_URL"
 fi
-git -C "$src" fetch -q --depth 1 origin "$TCC_COMMIT"
-git -C "$src" checkout -q -f --detach FETCH_HEAD
+git -C "$src" fetch -q --tags origin '+refs/heads/*:refs/remotes/origin/*'
+# a hash or a tag, else a branch name (TCC_COMMIT=mob: its tip)
+commit=$(git -C "$src" rev-parse -q --verify "$TCC_COMMIT^{commit}" ||
+  git -C "$src" rev-parse -q --verify "origin/$TCC_COMMIT^{commit}") || {
+  echo "tcc: $TCC_COMMIT is not in $TCC_URL (was the branch rewritten?)" >&2
+  exit 1
+}
+git -C "$src" checkout -q -f --detach "$commit"
 git -C "$src" clean -fdxq # no leftovers from an earlier build
 
 case "$(uname -s)" in
@@ -63,7 +73,7 @@ cp COPYING "$dist/tcc/COPYING"
 cat > "$dist/tcc/SOURCE.txt" <<TXT
 libtcc (TinyCC) is licensed under the GNU LGPL 2.1, see COPYING.
 Source: $TCC_URL
-Commit: $TCC_COMMIT
+Commit: $commit
 It is loaded at run time, never linked: replace libtcc.so / libtcc.dylib /
 libtcc.dll with your own build of tcc to change it.
 TXT

@@ -10,9 +10,6 @@
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>
-#ifdef __GLIBC__
-#include <gnu/libc-version.h>
-#endif
 
 // windows toolchains other than mingw gcc only export what is marked
 #ifdef _WIN32
@@ -498,20 +495,13 @@ static void test_tcc(void) {
 }
 
 #ifdef __linux__
-// tcc as a compiler program (C_AOT_TEST_TCC_PROGRAM: an installed tcc), on a
-// glibc older than 2.41, where it works. newer glibc refuse to dlopen what tcc
-// makes (it writes no PT_GNU_STACK header), so there the test is skipped
+// tcc as a compiler program (C_AOT_TEST_TCC_PROGRAM: an installed tcc). on
+// glibc 2.41 and later it needs a tcc from mob@772dc70d on (see
+// c_aot_memory_first_candidates), such as the bundled example's
 static void test_tcc_as_a_program(void) {
   const char* program = getenv("C_AOT_TEST_TCC_PROGRAM");
   if (!program || !program[0]) {
     puts("skipping the tcc as a program test (C_AOT_TEST_TCC_PROGRAM is not set)");
-    return;
-  }
-#ifdef __GLIBC__
-  int major = 0, minor = 0;
-  assert(sscanf(gnu_get_libc_version(), "%d.%d", &major, &minor) == 2);
-  if (major > 2 || (major == 2 && minor >= 41)) {
-    printf("skipping the tcc as a program test (glibc %d.%d refuses what tcc makes; it needs glibc < 2.41)\n", major, minor);
     return;
   }
   struct c_aot_candidate list[] = {c_aot_candidate_executable(program, NULL)};
@@ -524,11 +514,7 @@ static void test_tcc_as_a_program(void) {
   assert(c.type == C_AOT_COMPILE_OK && call_f(&c) == 3);
   c_aot_compile_result_destroy(&c);
   c_aot_resolve_result_destroy(&r);
-  printf("tcc as a program works with glibc %d.%d\n", major, minor);
-#else
-  puts("skipping the tcc as a program test (not glibc)");
-  (void)program;
-#endif
+  puts("tcc as a program works");
 }
 #endif
 

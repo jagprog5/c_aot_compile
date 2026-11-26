@@ -588,18 +588,19 @@ impl Candidate {
 /// - **Linux with the `no_memory_files` feature:** as "elsewhere", except that
 ///   `tcc` as a program stays last, as on Linux.
 ///
-/// Why `tcc` as a program is last on Linux: the libraries it builds have no
-/// `PT_GNU_STACK` header, which the loader reads as "needs an executable
-/// stack", and glibc 2.41 and later refuse to `dlopen` such a library (older
-/// glibc made the stack executable instead). It is still a candidate because
-/// that glibc may be older, and where it isn't, resolving fails it with the
-/// loader's own message and moves on, so it costs nothing but a test compile
-/// at the end of the list. libtcc, in process, has no such problem. See the
-/// README.
+/// Why `tcc` as a program is last on Linux: a tcc older than `mob@772dc70d`
+/// (2026-11-26; that includes 0.9.27, the last release, and so most installed
+/// ones) builds libraries with no `PT_GNU_STACK` header, which the loader reads
+/// as "needs an executable stack", and glibc 2.41 and later refuse to `dlopen`
+/// such a library (older glibc made the stack executable instead). A newer tcc,
+/// or an older glibc, works. Where neither is the case, resolving fails it with
+/// the loader's own message and moves on, so it costs nothing but a test
+/// compile at the end of the list. libtcc, in process, has no such problem.
 ///
 /// `bundled_tcc_library` is optional: a libtcc you bundle with your app (a
-/// path, or a bare name for the system loader), or `None` for none. "The system's" libtcc is an installed one,
-/// found by the loader; it is skipped if there is none.
+/// path, or a bare name for the system loader), or `None` for none. "The
+/// system's" libtcc is an installed one, found by the loader; it is skipped if
+/// there is none.
 pub fn memory_first_candidates(bundled_tcc_library: Option<&Path>) -> Vec<Candidate> {
     const MEMORY_FILES: bool = cfg!(all(target_os = "linux", not(feature = "no_memory_files")));
     let tcc_libraries: Vec<Candidate> = bundled_tcc_library

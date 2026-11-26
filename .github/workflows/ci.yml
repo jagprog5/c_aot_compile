@@ -21,7 +21,8 @@ jobs:
       matrix:
         include:
           - {name: ubuntu, os: ubuntu-latest, cc: ""}
-          # glibc 2.39, older than 2.41: tcc as a program works there, and is tested
+          # glibc 2.39, older than 2.41: tcc as a program worked there even
+          # before tcc wrote PT_GNU_STACK, so both sides of 2.41 are covered
           - {name: ubuntu 24.04, os: ubuntu-24.04, cc: ""}
           - {name: macos, os: macos-latest, cc: ""}
           - {name: windows (mingw gcc), os: windows-latest, cc: gcc}
@@ -111,8 +112,8 @@ jobs:
         run: C_AOT_TEST_TCC_DIR="$PWD/../c/examples/bundled-tcc/dist/tcc" cargo test --all-targets
 
       # the same tcc, installed the usual way (library in <prefix>/lib, support
-      # files in <prefix>/lib/tcc), and the tcc program itself (linux, glibc
-      # older than 2.41: the ubuntu 24.04 job. newer glibc skip it (upstream issue reported))
+      # files in <prefix>/lib/tcc), and the tcc program itself (tested on linux;
+      # the pinned tcc writes PT_GNU_STACK, so it works on any glibc)
 
       - name: tcc, installed layout, build (linux, macos)
         if: runner.os != 'Windows'

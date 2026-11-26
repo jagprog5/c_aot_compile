@@ -1700,18 +1700,19 @@ enum { C_AOT_PRESET_CANDIDATES_MAX = 12 };
 //   fastest), then $CC, then cc, gcc, clang (windows: gcc, clang, cc).
 // - with C_AOT_NO_MEMORY_FILES on linux: as "elsewhere", except that tcc as a
 //   program stays last, as on linux.
-// why tcc as a program is last on linux: the libraries it builds have no
-// PT_GNU_STACK header, which the loader reads as "needs an executable stack",
-// and glibc 2.41 and later refuse to dlopen such a library (older glibc made the
-// stack executable instead). it is still a candidate because that glibc may be
-// older, and where it isn't, resolving fails it with the loader's own message
-// and moves on, so it costs nothing but a test compile at the end of the list.
-// libtcc, in process, has no such problem. see the README
+// why tcc as a program is last on linux: a tcc older than mob@772dc70d
+// (2026-11-26; that includes 0.9.27, the last release, and so most installed
+// ones) builds libraries with no PT_GNU_STACK header, which the loader reads as
+// "needs an executable stack", and glibc 2.41 and later refuse to dlopen such a
+// library (older glibc made the stack executable instead). a newer tcc, or an
+// older glibc, works. where neither is the case, resolving fails it with the
+// loader's own message and moves on, so it costs nothing but a test compile at
+// the end of the list. libtcc, in process, has no such problem
 // bundled_tcc_library: optional, a libtcc you bundle with your app (a path, or
-// a bare name for the loader), or NULL for none. "the system's" libtcc is an installed one, found by the
-// loader; it is skipped if there is none. to give a libtcc a configure
-// function, set value.tcc_library.configure of the candidates of type
-// C_AOT_CANDIDATE_TCC_LIBRARY in out afterwards
+// a bare name for the loader), or NULL for none. "the system's" libtcc is an
+// installed one, found by the loader; it is skipped if there is none. to give a
+// libtcc a configure function, set value.tcc_library.configure of the
+// candidates of type C_AOT_CANDIDATE_TCC_LIBRARY in out afterwards
 static inline size_t c_aot_memory_first_candidates(struct c_aot_candidate* out, const char* bundled_tcc_library) {
 #ifdef _WIN32
   static const char* const names[] = {"gcc", "clang", "cc"};

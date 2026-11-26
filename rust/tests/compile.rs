@@ -508,20 +508,13 @@ fn tcc_compiled_code_calls_a_host_function_and_sees_settings_change() {
     assert_eq!(call_f(&first), 10, "the first is its own code");
 }
 
-/// tcc as a compiler program (`C_AOT_TEST_TCC_PROGRAM`: an installed tcc), on a
-/// glibc older than 2.41, where it works. Newer glibc refuse to `dlopen` what
-/// tcc makes (it writes no `PT_GNU_STACK` header), so there it is skipped.
-#[cfg(all(target_os = "linux", target_env = "gnu"))]
+/// tcc as a compiler program (`C_AOT_TEST_TCC_PROGRAM`: an installed tcc). On
+/// glibc 2.41 and later it needs a tcc from `mob@772dc70d` on (see
+/// [`memory_first_candidates`]), such as the bundled example's.
+#[cfg(target_os = "linux")]
 #[test]
-fn tcc_as_a_program_works_on_an_older_glibc() {
+fn tcc_as_a_program_works() {
     let Some(program) = std::env::var_os("C_AOT_TEST_TCC_PROGRAM").filter(|p| !p.is_empty()) else { return };
-    // SAFETY: gnu_get_libc_version returns a static C string.
-    let version = unsafe { std::ffi::CStr::from_ptr(libc::gnu_get_libc_version()) }.to_str().unwrap().to_owned();
-    let mut parts = version.split('.').map(|p| p.parse::<u32>().unwrap_or(0));
-    if (parts.next().unwrap_or(0), parts.next().unwrap_or(0)) >= (2, 41) {
-        eprintln!("skipping: glibc {version} refuses what tcc makes; it needs glibc < 2.41");
-        return;
-    }
-    let compiler = Compiler::resolve(&[Candidate::executable(std::path::PathBuf::from(program))]).unwrap_or_else(|e| panic!("glibc {version}: {e}"));
+    let compiler = Compiler::resolve(&[Candidate::executable(std::path::PathBuf::from(program))]).unwrap_or_else(|e| panic!("{e}"));
     assert_eq!(call_f(&compiler.compile(&f_source("3")).unwrap()), 3);
 }

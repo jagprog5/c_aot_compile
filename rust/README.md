@@ -100,7 +100,7 @@ These environment variables select what the tests use:
 - `C_AOT_TEST_COMPILER`: a compiler name or path to test with. Otherwise the memory first preset is used.
 - `C_AOT_TEST_TCC_DIR`: a directory holding a built libtcc with its `libtcc1.a` and `include/`, such as the C demo's
   `dist/tcc/`. This runs the tcc tests.
-- `C_AOT_TEST_TCC_PROGRAM`: the path of an installed `tcc` program. This tests tcc as a compiler program on Linux with
-  glibc older than 2.41, and is skipped on newer glibc.
+- `C_AOT_TEST_TCC_PROGRAM`: the path of an installed `tcc` program. This tests tcc as a compiler program on Linux. On
+  glibc 2.41 and later it needs a tcc from `mob@772dc70d` on, such as the one the C demo builds.
 
 The `no_memory_files` feature makes Linux use a temporary directory, as other systems do, to test that route.
