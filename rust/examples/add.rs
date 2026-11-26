@@ -1,3 +1,5 @@
+use c_aot_compile::Candidate;
+
 fn main() {
     let source = "\
 #ifndef MUST_BE_DEFINED
@@ -5,7 +7,23 @@ fn main() {
 #endif
 int add(int a, int b) { return a + b; }";
 
-    let lib = match c_aot_compile::compile(source, None, &["-DMUST_BE_DEFINED"]) {
+    // find a compiler once, and keep it. a compiler's args belong to its
+    // candidate (-O2 overrides the default -O1). tcc takes a configure function
+    // instead (Candidate::tcc_library_with)
+    let args = ["-O2", "-DMUST_BE_DEFINED"];
+    let compiler = match c_aot_compile::Compiler::resolve(&[
+        Candidate::env_with_args("CC", args), // $CC
+        Candidate::executable_with_args("cc", args),
+        Candidate::executable_with_args("gcc", args),
+        Candidate::executable_with_args("clang", args),
+    ]) {
+        Ok(compiler) => compiler,
+        Err(err) => {
+            eprintln!("{err}"); // says what was tried, and why each failed
+            std::process::exit(1);
+        }
+    };
+    let lib = match compiler.compile(source) {
         Ok(lib) => lib,
         Err(err) => {
             eprintln!("{err}");

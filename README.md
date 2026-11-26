@@ -1,70 +1,126 @@
-# Runtime C Compilation
+# c_aot_compile
 
-Emit then compile C source at runtime with a compiler. Available as a single C header and as a Rust crate. Both
-implement the same design.
-
-Is it JIT or AOT? Both, in a sense: the machine code is generated while your program runs (JIT-like flexibility), but
-by an ordinary ahead-of-time compiler that compiles a whole unit up front. There is no lazy per-function compilation
-or recompilation of hot code, so expect tens of milliseconds per compile, not microseconds.
-
-|      | Directory        | Use it as                                  |
-| ---- | ---------------- | ------------------------------------------ |
-| C    | [`c/`](c/)       | copy `c/c_aot_compile.h` into your project |
-| Rust | [`rust/`](rust/) | `c_aot_compile = { path = "rust" }`        |
-
-## But wait, this adds a whole compiler as a dependency?
-
-Yes.
-
-And that might be ok! Consider the following:
-
-- This lib works with all major compilers including: tcc, gcc, clang. Likely
-  others as well, and gets the same gains for free.
-- POSIX requires a C compiler. If your target is POSIX, then your dependency
-  will be there!
-- Note [tcc](https://bellard.org/tcc/). It's whole spiel is that it's tiny. If
-  needed, add tcc to the package.
+Write C at run time, compile it with a real C compiler, and call it. Cross-platform (Linux, macOS and Windows), as a
+single C header and as a Rust crate.
 
 ## Background
 
-Alternatives to this lib exist: [libtcc](https://github.com/frida/tinycc/blob/main/libtcc.h), [libgccjit](https://gcc.gnu.org/onlinedocs/jit/), [llvm](https://llvm.org/docs/tutorial/BuildingAJIT1.html), [MIR](https://github.com/vnmakarov/mir), [lightning](https://www.gnu.org/software/lightning/), [lightening](https://wingolog.org/archives/2019/05/24/lightening-run-time-code-generation), ...
+Programs often have work whose exact shape is only known at runtime. The usual answers are an interpreter, which is
+flexible but slow, or a JIT built on a code-generation library, which is fast but a large dependency with its own
+intermediate language to learn. Alternatives along those lines include
+[libtcc](https://github.com/frida/tinycc/blob/main/libtcc.h), [libgccjit](https://gcc.gnu.org/onlinedocs/jit/),
+[LLVM](https://llvm.org/docs/tutorial/BuildingAJIT1.html), [MIR](https://github.com/vnmakarov/mir),
+[lightning](https://www.gnu.org/software/lightning/) and
+[lightening](https://wingolog.org/archives/2019/05/24/lightening-run-time-code-generation).
 
-But all of them are harder to use! And they're pretty big! With this lib, just construct C code at runtime and use it!
+This library takes a simpler route: C is the intermediate language, and an ordinary compiler is the backend. You
+generate plain C text and get back callable functions with the full optimizer behind them, and nothing new to learn.
+The price is compile latency and needing a compiler, which is what the presets and bundled libtcc are for.
 
-It's [not a new idea](https://forums.raspberrypi.com/viewtopic.php?t=319919#p1962876). In fact, there's a [jit implementation for Ruby (called MJIT)](https://blog.heroku.com/ruby-mjit#mjit) that does something similar.
+It's [not a new idea](https://forums.raspberrypi.com/viewtopic.php?t=319919#p1962876). Ruby's
+[MJIT](https://blog.heroku.com/ruby-mjit#mjit) compiled hot methods the same way, by writing and compiling C.
 
-## Goals
+What it promises:
 
-- **Safe by default:** no hangs, truncated input, or silently loading the wrong code, including when
-  called from several threads.
-- **Simple and portable:** one design on every platform, using each platform's plain process and loader calls
-  (`posix_spawn` and `dlopen`; `CreateProcess` and `LoadLibrary`). Each compile gets a fresh private temp
-  directory (under `TMPDIR`, else `/tmp`; `TMP` / `TEMP` on Windows). The source and the compiled library are
-  files in it, and the directory is removed before the call returns (on Windows: when the library is unloaded,
-  since a loaded dll can't be deleted), whether it succeeded or not.
+1. **C text in, callable code out**, at the quality of the compiler that built it.
+2. **Works wherever there is a compiler.** Where there isn't, it falls back to a bundled libtcc if you ship one, or
+   otherwise reports clearly what was tried.
+3. **Safe by default.** It doesn't hang on a misbehaving compiler, doesn't truncate input, never loads the wrong code,
+   and can be used from several threads.
+4. **Leaves nothing behind.** It keeps files in memory where the system allows, and removes temporary files otherwise.
+5. **One design** for C and Rust, on Linux, macOS and Windows.
 
-### Files on disk
 
-The source and library do touch disk for a moment. To keep them in memory instead, point `TMPDIR` at a memory file
-system (for example `/dev/shm` on Linux). The compiler is a separate program, though, so anything that ignores
-`TMPDIR` or writes elsewhere (caches, extra args you pass) can still touch disk.
+## Example
 
-Between the compiler exiting and the library being loaded, a process running as the same user could modify the
-library file. The directory is private to your user, so other users can't.
+Find a compiler once, then compile as often as you like. The same code works on Linux, macOS and Windows.
 
-## Platform support
+```c
+#include "c_aot_compile.h"
 
-Linux, macOS and Windows, for both the C header and the Rust crate, all tested in CI. Other POSIX systems with
-`posix_spawn`, `mkdtemp` and `dlopen` likely work too.
+struct c_aot_resolve_result resolved = c_aot_compiler_resolve_fast(NULL);
+if (resolved.type == C_AOT_RESOLVE_ERR) { fputs(resolved.value.error_msg, stderr); return 1; }
 
-On Windows the compiler must have a gcc style command line (mingw gcc, clang, tcc); the default is `gcc`. MSVC's
-`cl` isn't supported. Symbols must be exported to be found: mingw gcc exports every global symbol unless something
-is marked `__declspec(dllexport)`, while other toolchains need it on whatever you look up.
+const char* src = "int add(int a, int b) { return a + b; }";
+struct c_aot_compile_result code = c_aot_compile(&resolved.value.compiler, src, strlen(src));
+if (code.type == C_AOT_COMPILE_ERR) { fputs(code.value.error_msg, stderr); return 1; }
 
-## Security
+int (*add)(int, int);
+*(void**)&add = c_aot_compile_symbol(&code, "add");
+printf("%d\n", add(1, 2)); // 3
 
-This is a JIT: it executes arbitrary code. Source and compiler must be trusted.
-The header comment and the crate docs list the details (environment passthrough, `PATH` lookup, diagnostics leaking file contents).
+c_aot_compile_result_destroy(&code);
+c_aot_resolve_result_destroy(&resolved);
+```
+
+```rust
+use c_aot_compile::Compiler;
+
+let compiler = Compiler::resolve_fast(None)?;
+let lib = compiler.compile("int add(int a, int b) { return a + b; }")?;
+let add = unsafe { lib.get::<extern "C" fn(i32, i32) -> i32>(c"add") }.unwrap();
+println!("{}", add(1, 2)); // 3
+```
+
+The C and Rust READMEs have the full examples: [C](c/README.md), [Rust](rust/README.md).
+
+**AOT or JIT?** Both, in a sense. The code is generated while your program runs, as with a JIT, but by an ordinary
+ahead-of-time compiler that compiles a whole unit up front. There is no lazy per-function compilation and no
+recompiling of hot code. Expect tens of milliseconds per compile with gcc or clang, and code as fast as any C those
+compilers produce.
+
+## Choosing the compiler
+
+A compiler is resolved once, from an ordered list of candidates. The first candidate that really works (it compiles a
+small test program) is the one you get. If none works, you get a single error that lists every candidate and why it
+failed:
+
+```
+no working compiler. tried:
+  1. environment variable "CC": not set
+  2. executable "cc": not found in PATH
+  3. executable "gcc": not found in PATH
+  4. executable "clang": not found in PATH
+```
+
+The list is yours to configure. Two ready-made ones, the presets, cover the usual choices:
+
+- **Fast** (`c_aot_compiler_resolve_fast`, `Compiler::resolve_fast`): the fastest generated code. It tries the system's
+  optimizing compilers first, with optimizing flags, and falls back to tcc last.
+- **Memory first** (`c_aot_compiler_resolve_memory_first`, `Compiler::resolve_memory_first`): keep source and compiled
+  code off disk where possible. On Linux the system compilers work in memory, so they come first. Elsewhere only libtcc
+  does, so it comes first there. This is a priority, not a guarantee: a compiler that writes temporary files is still
+  used if it is the only one.
+
+Both take an optional libtcc. If you bundle one as a fallback for systems with no compiler at all (see
+[below](#no-compiler-on-the-system-bundle-libtcc)), pass its path, otherwise `NULL` (`None` in Rust). The exact orders
+are documented in the header and the crate docs.
+
+### Your own list
+
+A candidate is one of:
+
+- **an executable**: a path, or a name looked up in `PATH`, as a shell does. Optionally with extra compiler args.
+- **an environment variable** such as `CC`, which names an executable. Optionally with extra compiler args.
+- **a tcc library**: a libtcc shared object. Optionally with a function that configures each tcc instance.
+
+## No compiler on the system? Bundle libtcc
+
+This is optional, for when a machine truly has no C compiler. [tcc](https://bellard.org/tcc/) is a small C compiler
+that is also a library, `libtcc`. Ship its shared object with your app and give it as a candidate, and your app can
+compile C anywhere.
+
+- It is loaded at run time, never linked, so your program starts and works without it, and a missing one is just a
+  candidate that failed.
+- It compiles in your process, to memory, with no files and no child process.
+- It doesn't optimize, so it fits best as the fallback: the presets put it after the system compilers on Linux, and
+  in the fast list.
+- You get libtcc by building it from [its source](https://repo.or.cz/tinycc.git). Distro packages usually ship only a
+  static library, which can't be loaded at run time. [`c/examples/bundled-tcc`](c/examples/bundled-tcc) builds it and
+  bundles it with an example app in one script, and is the thing to copy.
+- tcc is licensed under the LGPL 2.1, while this library is MIT/Apache and contains none of tcc's code. Whoever ships a
+  libtcc carries the LGPL's duties for it: its license text, where to get its source, and leaving it replaceable. The
+  demo's bundle does all three. This isn't legal advice.
 
 ## License
 
@@ -73,6 +129,7 @@ Licensed under either of
 - Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
 - MIT license ([LICENSE-MIT](LICENSE-MIT))
 
-at your option.
+at your option. This library doesn't include or link libtcc (LGPL 2.1), see
+[No compiler on the system?](#no-compiler-on-the-system-bundle-libtcc).
 
 Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in this work, as defined in the Apache-2.0 license, shall be dual licensed as above, without any additional terms or conditions.

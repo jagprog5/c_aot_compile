@@ -4,10 +4,15 @@ on:
   push:
   pull_request:
 
+# The steps are small, so the name of the failed step says what failed.
+
 jobs:
   test:
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
     env:
       # the compiler the tests use; empty means the library's default
       C_AOT_TEST_COMPILER: ${{ matrix.cc }}
@@ -16,36 +21,135 @@ jobs:
       matrix:
         include:
           - {name: ubuntu, os: ubuntu-latest, cc: ""}
+          # glibc 2.39, older than 2.41: tcc as a program works there, and is tested
+          - {name: ubuntu 24.04, os: ubuntu-24.04, cc: ""}
           - {name: macos, os: macos-latest, cc: ""}
           - {name: windows (mingw gcc), os: windows-latest, cc: gcc}
           - {name: windows (clang), os: windows-latest, cc: clang}
     steps:
       - uses: actions/checkout@v4
 
-      - name: C header (linux, macos)
+      # ---- C header
+
+      - name: C tests (linux, macos)
         if: runner.os != 'Windows'
         working-directory: c
         run: |
           cc --version
-          cc -Wall -Wextra -Werror tests/test.c -I. -ldl -o c_aot_test
+          cc -Wall -Wextra -Werror tests/test.c -I. -ldl -lpthread -o c_aot_test
           ./c_aot_test
-          cc -Wall -Wextra -Werror examples/add.c -ldl -o add
+
+      - name: C tests, temp directory route (linux, macos)
+        if: runner.os != 'Windows'
+        working-directory: c
+        # linux uses memory files by default; this is the route every other system takes
+        run: |
+          cc -Wall -Wextra -Werror -DC_AOT_NO_MEMORY_FILES tests/test.c -I. -ldl -lpthread -o c_aot_test_disk
+          ./c_aot_test_disk
+
+      - name: C example (linux, macos)
+        if: runner.os != 'Windows'
+        working-directory: c
+        run: |
+          cc -Wall -Wextra -Werror examples/add.c -ldl -lpthread -o add
           ./add
 
-      - name: C header (windows)
+      - name: C tests (windows)
         if: runner.os == 'Windows'
-        shell: bash
         working-directory: c
         run: |
           ${{ matrix.cc }} --version
           ${{ matrix.cc }} -Wall -Wextra -Werror tests/test.c -I. -o c_aot_test.exe
           ./c_aot_test.exe
+
+      - name: C example (windows)
+        if: runner.os == 'Windows'
+        working-directory: c
+        run: |
           ${{ matrix.cc }} -Wall -Wextra -Werror examples/add.c -o add.exe
           ./add.exe
 
-      - name: Rust crate
+      # ---- Rust crate
+
+      - name: Rust tests
+        working-directory: rust
+        run: cargo test --all-targets
+
+      - name: Rust tests, temp directory route
+        working-directory: rust
+        run: cargo test --all-targets --features no_memory_files
+
+      - name: Rust doc tests and example
         working-directory: rust
         run: |
-          cargo test --all-targets
           cargo test --doc
           cargo run --example add
+
+      # ---- tcc: build libtcc and bundle it with the demo, then test with it
+
+      - name: tcc, build (linux, macos)
+        if: runner.os != 'Windows'
+        working-directory: c/examples/bundled-tcc
+        run: ./build.sh
+
+      - name: tcc, demo app (linux, macos)
+        if: runner.os != 'Windows'
+        working-directory: c/examples/bundled-tcc
+        run: |
+          ./dist/app "x * x + 1" 7
+          # the libtcc path, whatever the preset picks
+          ./dist/app --bundled-only "x * x + 1" 7
+
+      - name: tcc, C tests (linux, macos)
+        if: runner.os != 'Windows'
+        working-directory: c
+        run: C_AOT_TEST_TCC_DIR="$PWD/examples/bundled-tcc/dist/tcc" ./c_aot_test
+
+      - name: tcc, Rust tests (linux, macos)
+        if: runner.os != 'Windows'
+        working-directory: rust
+        run: C_AOT_TEST_TCC_DIR="$PWD/../c/examples/bundled-tcc/dist/tcc" cargo test --all-targets
+
+      # the same tcc, installed the usual way (library in <prefix>/lib, support
+      # files in <prefix>/lib/tcc), and the tcc program itself (linux, glibc
+      # older than 2.41: the ubuntu 24.04 job. newer glibc skip it (upstream issue reported))
+
+      - name: tcc, installed layout, build (linux, macos)
+        if: runner.os != 'Windows'
+        working-directory: c/examples/bundled-tcc/build/tinycc
+        run: |
+          ./configure --disable-static --prefix="$PWD/../install" > /dev/null
+          make clean > /dev/null
+          make -j"$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 2)" > /dev/null
+          make install > /dev/null
+          ls ../install/bin ../install/lib ../install/lib/tcc
+
+      - name: tcc, installed layout, C tests (linux, macos)
+        if: runner.os != 'Windows'
+        working-directory: c
+        run: |
+          install="$PWD/examples/bundled-tcc/build/install"
+          C_AOT_TEST_TCC_DIR="$install/lib" C_AOT_TEST_TCC_PROGRAM="$install/bin/tcc" ./c_aot_test
+
+      - name: tcc, installed layout, Rust tests (linux, macos)
+        if: runner.os != 'Windows'
+        working-directory: rust
+        run: |
+          install="$PWD/../c/examples/bundled-tcc/build/install"
+          C_AOT_TEST_TCC_DIR="$install/lib" C_AOT_TEST_TCC_PROGRAM="$install/bin/tcc" cargo test --all-targets
+
+      - name: tcc, build (windows)
+        if: runner.os == 'Windows'
+        working-directory: c/examples/bundled-tcc
+        run: ./build.sh
+
+      - name: tcc, C tests (windows)
+        if: runner.os == 'Windows'
+        working-directory: c
+        # a windows style path ("D:/a/..."), which native programs understand
+        run: C_AOT_TEST_TCC_DIR="$(pwd -W)/examples/bundled-tcc/dist/tcc" ./c_aot_test.exe
+
+      - name: tcc, Rust tests (windows)
+        if: runner.os == 'Windows'
+        working-directory: rust
+        run: C_AOT_TEST_TCC_DIR="$(cd ../c/examples/bundled-tcc/dist/tcc && pwd -W)" cargo test --all-targets

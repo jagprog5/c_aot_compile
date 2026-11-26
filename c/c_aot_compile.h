@@ -6,21 +6,33 @@
  * linux and macos (posix_spawn, mkdtemp, dlopen; likely other posix systems
  * too) and windows (CreateProcess, LoadLibrary; needs a gcc style compiler
  * driver such as mingw gcc, clang or tcc, see the windows notes below). link
- * with -ldl on linux with glibc < 2.34. _GNU_SOURCE is defined here if
+ * with -ldl -lpthread on linux with glibc < 2.34 (nothing extra newer, or on
+ * macos or windows). _GNU_SOURCE is defined here if
  * missing, but only works if this header comes before any system header;
  * otherwise define it yourself.
  *
- * design (each point removes a class of bugs):
- * - each compile gets a fresh private (0700) directory from mkdtemp, under
- *   TMPDIR (or /tmp). it and everything in it is removed before returning,
- *   whether the compile succeeded or not.
- * - the source is written to a file there, which is unlinked right away and
- *   given to the compiler as stdin. no pipe to feed, so no deadlock, short
- *   write or SIGPIPE handling.
- * - the compiler writes the library to a path in that directory. the random
- *   directory name makes the path unique (dlopen would otherwise return an
- *   already loaded library of the same path), and the library's fd is kept
- *   open while it is loaded, so its inode can't be reused either.
+ * usage: resolve a compiler once (a preset: c_aot_compiler_resolve_fast or
+ * c_aot_compiler_resolve_memory_first, or your own list of candidates), then
+ * c_aot_compile(&compiler, source, size) any
+ * number of times. a candidate is a path, a program name looked up in PATH, an
+ * environment variable (like CC), or a libtcc shared object. libtcc is not
+ * part of this header and is loaded at run time with dlopen / LoadLibrary, so
+ * a program using this header runs (and says what is missing) without it.
+ * with a libtcc, code is compiled in this process, to memory.
+ *
+ * design of the executable backend (each point removes a class of bugs).
+ * the compiler is run as:
+ *   <compiler> -pipe -fPIC -shared -O1 -xc -o <library> - <candidate's args>
+ * (no -fPIC on windows). the candidate's args come last, so a later -O2 or -O0
+ * overrides
+ * the -O1.
+ * - the source is a file, which is the compiler's stdin: no pipe to feed, so
+ *   no deadlock, short write or SIGPIPE handling.
+ * - the compiler writes the library to a file, and the library's fd is kept
+ *   open while it is loaded, so its inode can't be reused.
+ * - where those files are depends on the system (see "files" below). the
+ *   name the library is loaded by is always unique (dlopen would otherwise
+ *   return an already loaded library of the same name).
  * - the compiler is started with posix_spawn, so no code runs in a forked
  *   child of this (possibly threaded) process.
  * - every fd is close-on-exec and numbered >= 10, so nothing leaks into our
@@ -28,9 +40,33 @@
  *   made close-on-exec just after it's created, so another thread spawning a
  *   program at that very instant could inherit it.)
  *
- * the files do touch disk (unless TMPDIR is a memory file system), and
+ * files:
+ * - linux: the source and the library are memory files (memfd_create), and
+ *   never touch disk. the compiler writes the library to its stdout, a memory
+ *   file, by the path /dev/fd/1, and the library is loaded from
+ *   /proc/self/fd/<fd>. so a compiler program (or a wrapper around one, such as
+ *   a CC script) must not write anything to its stdout: that would land in the
+ *   library and corrupt it (resolving then fails with "invalid ELF header").
+ *   compilers don't, and their diagnostics go to stderr. a wrapper that does
+ *   can redirect its own output to stderr, or use C_AOT_NO_MEMORY_FILES. if the kernel has no memfd_create, or no /dev/fd, the
+ *   next case applies. define C_AOT_NO_MEMORY_FILES to use it anyway.
+ * - everywhere else (macos, other unix, windows): each compile gets a fresh
+ *   private (0700) directory from mkdtemp, under TMPDIR (or /tmp), holding the
+ *   source (unlinked right away) and the library. it is removed before
+ *   returning, whether the compile succeeded or not. these systems have no
+ *   memory file a compiler can open by path. to keep the files in memory
+ *   anyway, point TMPDIR at a memory file system.
+ * - either way, what a compiler writes itself while it works (gcc leaves
+ *   intermediate files in TMPDIR even with -pipe) goes where its TMPDIR says,
+ *   and the compiler's TMPDIR is set by this header (unix; not windows):
+ *   with a temp directory, to that private directory, so those files are
+ *   contained and removed with it. with memory files, to /dev/shm if it is a
+ *   writable directory, even if your TMPDIR is set (if /dev/shm isn't usable,
+ *   yours is left as it is). this is the only change to the compiler's
+ *   environment. (define C_AOT_NO_MEMORY_FILES to have everything under your
+ *   TMPDIR instead.)
  * between the compiler exiting and dlopen, a process running as the same user
- * could modify the library.
+ * could modify a library on disk. a memory file has no path to open by.
  *
  * windows notes: the same design, with these differences.
  * - the directory is created under GetTempPath (TMP / TEMP) and inherits that
@@ -41,8 +77,8 @@
  * - a loaded dll can't be deleted, so the library file is opened with
  *   delete-on-close and kept open while loaded; the directory is removed by
  *   c_aot_compile_result_destroy.
- * - the default compiler is "gcc" (there is no "cc"), and the library is
- *   named lib.dll. -fPIC isn't passed.
+ * - the presets try gcc, clang, cc in that order (not cc, gcc, clang), and
+ *   the library is named lib.dll. -fPIC isn't passed.
  * - symbols must be exported to be found: mingw gcc exports every global
  *   symbol unless something is marked dllexport; clang (msvc target) and
  *   others need __declspec(dllexport) on what you look up.
@@ -52,6 +88,13 @@
 
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
+
+// linux: the source and the library of a compiler program live in memory files
+// (memfd_create) and never touch disk. define C_AOT_NO_MEMORY_FILES to use a
+// private temp directory there too, as every other system does
+#if defined(__linux__) && !defined(C_AOT_NO_MEMORY_FILES)
+#define C_AOT_MEMORY_FILES 1
 #endif
 
 #include <stdarg.h>
@@ -74,7 +117,13 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <pthread.h>
 #include <spawn.h>
+#ifdef C_AOT_MEMORY_FILES
+#include <sys/mman.h>
+#include <sys/syscall.h>
+#endif
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -83,92 +132,345 @@
 #endif
 #endif
 
+// ============================ compilers ================================
+
+// the libtcc entry points (resolved by name from the loaded library). the
+// first group is always there; a libtcc without one of the second group (an
+// older one) leaves it NULL, so check before calling
+struct c_aot_tcc_api {
+  void* (*tcc_new)(void);
+  void (*tcc_delete)(void*);
+  void (*tcc_set_lib_path)(void*, const char*);
+  void (*tcc_set_error_func)(void*, void*, void (*)(void*, const char*));
+  int (*tcc_set_output_type)(void*, int);
+  int (*tcc_add_include_path)(void*, const char*);
+  void (*tcc_define_symbol)(void*, const char*, const char*);
+  int (*tcc_add_library_path)(void*, const char*);
+  int (*tcc_add_library)(void*, const char*);
+  int (*tcc_compile_string)(void*, const char*);
+  // tcc 0.9.27 takes (state, ptr), newer versions (state). it's called with
+  // both: the extra argument is harmless to the newer one
+  int (*tcc_relocate)(void*, void*);
+  void* (*tcc_get_symbol)(void*, const char*);
+
+  // may be NULL:
+  // gcc style options in one string, as on tcc's command line. an option tcc
+  // doesn't know makes tcc 0.9.27 exit the whole process (newer ones return
+  // -1), and that version returns nothing: don't rely on the result
+  int (*tcc_set_options)(void*, const char*);
+  int (*tcc_add_sysinclude_path)(void*, const char*);
+  void (*tcc_undefine_symbol)(void*, const char*);
+  // makes a symbol of your program visible to the compiled code
+  int (*tcc_add_symbol)(void*, const char*, const void*);
+  int (*tcc_add_file)(void*, const char*);
+};
+
+// called with every new tcc state, before the source is compiled: to set
+// options on it directly (analogous to CLI args for the executable candidates,
+// but for the lib instead). tcc_state is the non-NULL result of tcc_new(). it
+// has its error function, support directory and memory output already set.
+// return 0 to carry on and compile the source, or nonzero to stop before it is
+// compiled (the compile then returns an error saying so). runs under libtcc's
+// global lock: don't compile from inside it. it also runs for the test program
+// when resolving
+typedef int (*c_aot_tcc_configure)(void* tcc_state, const struct c_aot_tcc_api* api, void* user_data);
+
+// a compiler is found by trying candidates in order (c_aot_compiler_resolve);
+// the first that really works wins. each candidate is one of these, and has
+// only what that kind can use:
+enum c_aot_candidate_type {
+  C_AOT_CANDIDATE_EXECUTABLE,
+  C_AOT_CANDIDATE_ENV,
+  C_AOT_CANDIDATE_TCC_LIBRARY,
+};
+
+// an executable, found like a shell does: with a directory separator it is a
+// path (a relative one is relative to the current directory), else it is a name
+// looked up in PATH. a program only: its args are separate
+struct c_aot_candidate_executable {
+  const char* compiler_exe_path_or_name;
+  // extra compiler args: a NULL terminated list, or NULL for none. they come
+  // after the fixed ones (-pipe -fPIC -shared -O1 -xc -o <library> -), so a
+  // later -O2 overrides the -O1. copied when resolving, so the list need not
+  // outlive it
+  const char* const* args;
+};
+
+// the name of an environment variable, whose value is an executable as above.
+// not set or empty: skipped
+struct c_aot_candidate_env {
+  const char* variable;
+  const char* const* args; // as for an executable
+};
+
+// a libtcc shared object, found the same way (a path, or a bare name the system
+// loader searches for). tcc also needs its support files, libtcc1.a and
+// include/: if they are next to the library (libtcc1.a, or lib/libtcc1.a as on
+// windows), that directory is used, as in an app that ships them together.
+// otherwise tcc's own built-in location is used, as in a tcc that is
+// installed. tcc then compiles in this process: no files, no child process
+struct c_aot_candidate_tcc_library {
+  const char* library_path_or_name;
+  // sets options on each new tcc state, however you like. NULL: none
+  c_aot_tcc_configure configure;
+  // passed to configure, on every compile. only the pointer is copied, not what
+  // it points to (and it is never freed here): that must stay valid until the
+  // c_aot_resolve_result that holds the compiler is destroyed, not only until
+  // resolving returns. the candidate list itself need not outlive resolving
+  void* user_data;
+};
+
+union c_aot_candidate_value {
+  struct c_aot_candidate_executable executable;
+  struct c_aot_candidate_env env;
+  struct c_aot_candidate_tcc_library tcc_library;
+};
+
+struct c_aot_candidate {
+  enum c_aot_candidate_type type;
+  union c_aot_candidate_value value;
+};
+
+// args: NULL terminated, or NULL for none
+static inline struct c_aot_candidate c_aot_candidate_executable(const char* compiler_exe_path_or_name, const char* const* args) {
+  struct c_aot_candidate c;
+  c.type = C_AOT_CANDIDATE_EXECUTABLE;
+  c.value.executable.compiler_exe_path_or_name = compiler_exe_path_or_name;
+  c.value.executable.args = args;
+  return c;
+}
+static inline struct c_aot_candidate c_aot_candidate_env(const char* variable, const char* const* args) {
+  struct c_aot_candidate c;
+  c.type = C_AOT_CANDIDATE_ENV;
+  c.value.env.variable = variable;
+  c.value.env.args = args;
+  return c;
+}
+// configure: may be NULL
+static inline struct c_aot_candidate c_aot_candidate_tcc_library(const char* library_path_or_name, c_aot_tcc_configure configure, void* user_data) {
+  struct c_aot_candidate c;
+  c.type = C_AOT_CANDIDATE_TCC_LIBRARY;
+  c.value.tcc_library.library_path_or_name = library_path_or_name;
+  c.value.tcc_library.configure = configure;
+  c.value.tcc_library.user_data = user_data;
+  return c;
+}
+
+enum c_aot_compiler_type {
+  C_AOT_COMPILER_EXECUTABLE, // a compiler program: see value.executable
+  C_AOT_COMPILER_TCC,        // libtcc, in this process: see value.tcc
+};
+
+struct c_aot_compiler_executable {
+  // the program: a path, made absolute (symlinks are kept). malloc'd
+  char* path;
+  // the candidate's extra args: a NULL terminated list, or NULL for none. malloc'd
+  char** args;
+};
+
+struct c_aot_compiler_tcc {
+  void* library;            // the loaded libtcc
+  struct c_aot_tcc_api api; // the functions looked up in it
+  c_aot_tcc_configure configure; // the candidate's, or NULL
+  void* configure_user_data;
+  // where tcc's support files (libtcc1.a, include/) are, applied on every
+  // compile: the directory next to the library (see C_AOT_CANDIDATE_TCC_LIBRARY).
+  // NULL: tcc's own built-in location. malloc'd
+  char* support_dir;
+};
+
+union c_aot_compiler_value {
+  // only if C_AOT_COMPILER_EXECUTABLE
+  struct c_aot_compiler_executable executable;
+  // only if C_AOT_COMPILER_TCC
+  struct c_aot_compiler_tcc tcc;
+};
+
+// a working compiler. it can be used from several threads at once, and must
+// outlive every c_aot_compile_result made with it (and must not be moved
+// while one lives: tcc results point into it). it is owned by the
+// c_aot_resolve_result that holds it
+struct c_aot_compiler {
+  enum c_aot_compiler_type type;
+  // the index of the candidate that worked
+  size_t candidate;
+  union c_aot_compiler_value value;
+};
+
+enum c_aot_resolve_result_type {
+  C_AOT_RESOLVE_OK,
+  C_AOT_RESOLVE_ERR,
+};
+
+union c_aot_resolve_result_value {
+  // only if C_AOT_RESOLVE_OK
+  struct c_aot_compiler compiler;
+  // only if C_AOT_RESOLVE_ERR: why no candidate worked, one line per
+  // candidate. malloc'd. NULL only on alloc failure
+  char* error_msg;
+};
+
+// an error message, or a compiler. free with c_aot_resolve_result_destroy, in
+// both cases.
+struct c_aot_resolve_result {
+  enum c_aot_resolve_result_type type;
+  union c_aot_resolve_result_value value;
+};
+
+// the code that was compiled, and what keeps it alive. it is one of these:
+enum c_aot_code_type {
+  C_AOT_CODE_LIBRARY, // a shared library, loaded (a compiler program made it)
+  C_AOT_CODE_TCC,     // code in memory, owned by a tcc state (libtcc made it)
+};
+
+struct c_aot_code_library {
+  void* handle; // dlopen / LoadLibrary
+#ifdef _WIN32
+  // the library file (a HANDLE, opened delete-on-close), kept open as long as
+  // the library is loaded
+  void* file;
+  // the directory holding the library file. malloc'd. removed by destroy
+  char* tmp_dir;
+#else
+  // the (already deleted) library file, kept open as long as the library is loaded
+  int fd;
+#endif
+};
+
+struct c_aot_code_tcc {
+  // the compiler's libtcc functions: they live in the compiler, which
+  // must outlive this
+  const struct c_aot_tcc_api* api;
+  // the tcc state that owns the code
+  void* state;
+};
+
+union c_aot_code_value {
+  // only if C_AOT_CODE_LIBRARY
+  struct c_aot_code_library library;
+  // only if C_AOT_CODE_TCC
+  struct c_aot_code_tcc tcc;
+};
+
+struct c_aot_code {
+  enum c_aot_code_type type;
+  union c_aot_code_value value;
+};
+
 enum c_aot_compile_result_type {
   C_AOT_COMPILE_OK,
   C_AOT_COMPILE_ERR,
 };
 
 union c_aot_compile_result_value {
-  // only if C_AOT_COMPILE_OK. never NULL
-  void* dl_handle;
+  // only if C_AOT_COMPILE_OK
+  struct c_aot_code code;
   // only if C_AOT_COMPILE_ERR. malloc'd. NULL only on alloc failure
   char* error_msg;
 };
 
-// either err with error message, or ok with handle.
-// free with c_aot_compile_result_destroy, in both cases.
+// an error message, or the compiled code. free with c_aot_compile_result_destroy,
+// in both cases.
 struct c_aot_compile_result {
   enum c_aot_compile_result_type type;
   union c_aot_compile_result_value value;
-#ifdef _WIN32
-  // only if C_AOT_COMPILE_OK (else NULL): the library file (a HANDLE, opened
-  // delete-on-close), kept open as long as the library is loaded
-  void* code_file;
-  // only if C_AOT_COMPILE_OK (else NULL): malloc'd, the directory holding the
-  // library file. removed by c_aot_compile_result_destroy
-  char* tmp_dir;
-#else
-  // only if C_AOT_COMPILE_OK (else -1): the (already deleted) library file.
-  // kept open as long as the library is loaded
-  int code_fd;
-#endif
 };
+
+static inline void c_aot_result_init(struct c_aot_compile_result* result) {
+  result->type = C_AOT_COMPILE_ERR;
+  result->value.error_msg = NULL;
+}
 
 static void c_aot_remove_dir(const char* dir);
 
-// ok: unload the library, then close the library file. err: free the message.
-// the result must not be used afterwards.
+// libtcc keeps global state, so everything that uses it holds this lock. (one
+// per translation unit that includes this header; use the header from one
+// translation unit if tcc is used from several threads)
+static void c_aot_tcc_lock(void);
+static void c_aot_tcc_unlock(void);
+
+// ok: unload the library, then close the library file (or free the tcc
+// state). err: free the message. the result must not be used afterwards.
 static void c_aot_compile_result_destroy(struct c_aot_compile_result* result) {
   if (result->type == C_AOT_COMPILE_OK) {
+    struct c_aot_code* code = &result->value.code;
+    switch (code->type) {
+    case C_AOT_CODE_LIBRARY: {
+      struct c_aot_code_library* library = &code->value.library;
 #ifdef _WIN32
-    if (result->value.dl_handle) {
-      FreeLibrary((HMODULE)result->value.dl_handle);
-    }
-    if (result->code_file) {
-      CloseHandle((HANDLE)result->code_file); // deletes the library file
-    }
-    if (result->tmp_dir) {
-      c_aot_remove_dir(result->tmp_dir);
-      free(result->tmp_dir);
-    }
+      FreeLibrary((HMODULE)library->handle);
+      CloseHandle((HANDLE)library->file); // deletes the library file
+      c_aot_remove_dir(library->tmp_dir);
+      free(library->tmp_dir);
 #else
-    if (result->value.dl_handle) {
-      dlclose(result->value.dl_handle);
-    }
-    if (result->code_fd != -1) {
-      close(result->code_fd);
-    }
+      dlclose(library->handle);
+      close(library->fd);
 #endif
+      break;
+    }
+    case C_AOT_CODE_TCC:
+      c_aot_tcc_lock();
+      code->value.tcc.api->tcc_delete(code->value.tcc.state);
+      c_aot_tcc_unlock();
+      break;
+    }
   } else {
     free(result->value.error_msg);
   }
-  result->type = C_AOT_COMPILE_ERR;
-  result->value.error_msg = NULL;
-#ifdef _WIN32
-  result->code_file = NULL;
-  result->tmp_dir = NULL;
-#else
-  result->code_fd = -1;
-#endif
+  c_aot_result_init(result);
 }
 
-// looks up a symbol in a loaded library (dlsym / GetProcAddress). NULL if
-// it's not found, or result isn't ok. the pointer is valid until destroy.
+// looks up a symbol in the compiled code (dlsym / GetProcAddress / tcc_get_symbol).
+// NULL if it's not found, or result isn't ok. the pointer is valid until
+// c_aot_compile_result_destroy is called on this result. for tcc code it also
+// needs the c_aot_resolve_result whose compiler made it: that must not be
+// destroyed or moved yet (this result points into it).
 static inline void* c_aot_compile_symbol(const struct c_aot_compile_result* result, const char* name) {
-  if (result->type != C_AOT_COMPILE_OK || !result->value.dl_handle) {
+  if (result->type != C_AOT_COMPILE_OK) {
     return NULL;
   }
+  const struct c_aot_code* code = &result->value.code;
+  switch (code->type) {
+  case C_AOT_CODE_LIBRARY: {
 #ifdef _WIN32
-  FARPROC proc = GetProcAddress((HMODULE)result->value.dl_handle, name);
-  void* symbol = NULL;
-  memcpy(&symbol, &proc, sizeof(symbol)); // function pointer -> void*
-  return symbol;
+    FARPROC proc = GetProcAddress((HMODULE)code->value.library.handle, name);
+    void* symbol = NULL;
+    memcpy(&symbol, &proc, sizeof(symbol)); // function pointer -> void*
+    return symbol;
 #else
-  return dlsym(result->value.dl_handle, name);
+    return dlsym(code->value.library.handle, name);
 #endif
+  }
+  case C_AOT_CODE_TCC: {
+    c_aot_tcc_lock();
+    void* symbol = code->value.tcc.api->tcc_get_symbol(code->value.tcc.state, name);
+    c_aot_tcc_unlock();
+    return symbol;
+  }
+  }
+  return NULL;
 }
 
 // ============================== internals ==============================
+
+// getenv, without the deprecation warning msvc's headers give for it (an error
+// under -Werror, which would make every user define _CRT_SECURE_NO_WARNINGS)
+static const char* c_aot_getenv(const char* name) {
+#if defined(_MSC_VER) && defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+#elif defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(disable : 4996)
+#endif
+  const char* value = getenv(name);
+#if defined(_MSC_VER) && defined(__clang__)
+#pragma clang diagnostic pop
+#elif defined(_MSC_VER)
+#pragma warning(pop)
+#endif
+  return value;
+}
 
 // errno / GetLastError as text. passed as an argument to c_aot_set_err (macos
 // printf has no %m), so it's evaluated before anything in there could change
@@ -246,6 +548,38 @@ static char** c_aot_environ(void) {
 #endif
 }
 
+// a copy of the environment with name set to value, for a child. one
+// allocation: free it with free(). NULL if out of memory
+static char** c_aot_environ_with(const char* name, const char* value) {
+  char** env = c_aot_environ();
+  size_t count = 0;
+  while (env[count]) {
+    ++count;
+  }
+  size_t name_len = strlen(name);
+  size_t entry_size = name_len + 1 + strlen(value) + 1;
+  char** copy = malloc((count + 2) * sizeof(*copy) + entry_size);
+  if (!copy) {
+    return NULL;
+  }
+  char* entry = (char*)(copy + count + 2); // the new entry lives after the pointers
+  snprintf(entry, entry_size, "%s=%s", name, value);
+  size_t n = 0;
+  for (size_t i = 0; i < count; ++i) {
+    if (strncmp(env[i], name, name_len) != 0 || env[i][name_len] != '=') {
+      copy[n++] = env[i];
+    }
+  }
+  copy[n++] = entry;
+  copy[n] = NULL;
+  return copy;
+}
+
+static bool c_aot_is_writable_dir(const char* path) {
+  struct stat st;
+  return stat(path, &st) == 0 && S_ISDIR(st.st_mode) && access(path, W_OK | X_OK) == 0;
+}
+
 // removes dir and the files in it (the compiler may leave some behind on
 // failure; it makes no subdirectories). errors are ignored: best effort
 static void c_aot_remove_dir(const char* dir) {
@@ -263,24 +597,10 @@ static void c_aot_remove_dir(const char* dir) {
 }
 #endif // !_WIN32
 
-// ================================ api ==================================
+// ============================ executables ==============================
 
-// compiles the c source in source[0, source_size) to a shared library and
-// loads it. the source need not be NUL terminated.
-//
-// c_compiler: program to run. NULL means "cc" ("gcc" on windows). if it has no
-//   '/', it is looked up in PATH (prefer an absolute path).
-// compiler_args: NULL terminated list of extra compiler args (may be NULL).
-//
-// warning! this is a JIT: an avenue for arbitrary code execution. the source
-// and c_compiler must be trusted/constant. also:
-// - the environment is passed to the compiler unchanged. variables such as
-//   GCC_EXEC_PREFIX, COMPILER_PATH, CPATH, LIBRARY_PATH, LD_PRELOAD change
-//   what it runs or includes.
-// - compiler diagnostics are returned in the error message; with outside
-//   influenced source, #include "/secret" can leak file fragments through it.
-// - SIGCHLD must not be ignored / children not reaped elsewhere (waitpid would
-//   fail with ECHILD).
+// compiles with the executable at c_compiler (a path; already resolved). see
+// c_aot_compile for the rest. the platform specific part:
 #ifdef _WIN32
 
 enum { C_AOT_PATH_MAX = 1024 };
@@ -340,16 +660,10 @@ static char* c_aot_win_append_arg(char* out, const char* arg) {
   return out;
 }
 
-static struct c_aot_compile_result c_aot_compile(const char* source, size_t source_size, const char* c_compiler, const char* const* compiler_args) {
+static struct c_aot_compile_result c_aot_compile_exec(const char* source, size_t source_size, const char* c_compiler, const char* const* compiler_args) {
   struct c_aot_compile_result result;
-  result.type = C_AOT_COMPILE_ERR;
-  result.value.error_msg = NULL;
-  result.code_file = NULL;
-  result.tmp_dir = NULL;
+  c_aot_result_init(&result);
 
-  if (!c_compiler) {
-    c_compiler = "gcc";
-  }
   static const char* const no_args[] = {NULL};
   if (!compiler_args) {
     compiler_args = no_args;
@@ -411,7 +725,7 @@ static struct c_aot_compile_result c_aot_compile(const char* source, size_t sour
     while (compiler_args[num_extra]) {
       ++num_extra;
     }
-    const char* fixed[] = {c_compiler, "-pipe", "-shared", "-O2", "-xc", "-o", lib_path, "-"};
+    const char* fixed[] = {c_compiler, "-pipe", "-shared", "-O1", "-xc", "-o", lib_path, "-"};
     const size_t num_fixed = sizeof(fixed) / sizeof(fixed[0]);
     size_t capacity = 1;
     for (size_t i = 0; i < num_fixed + num_extra; ++i) {
@@ -591,9 +905,10 @@ static struct c_aot_compile_result c_aot_compile(const char* source, size_t sour
     }
     memcpy(dir_copy, tmp_dir, dir_size);
     result.type = C_AOT_COMPILE_OK;
-    result.value.dl_handle = (void*)handle;
-    result.code_file = (void*)lib_file; // ownership moves to the result
-    result.tmp_dir = dir_copy;
+    result.value.code.type = C_AOT_CODE_LIBRARY;
+    result.value.code.value.library.handle = (void*)handle;
+    result.value.code.value.library.file = (void*)lib_file; // ownership moves to the result
+    result.value.code.value.library.tmp_dir = dir_copy;
     lib_file = INVALID_HANDLE_VALUE;
     keep_tmp_dir = true;
   }
@@ -627,15 +942,50 @@ end:
 
 #else // !_WIN32
 
-static struct c_aot_compile_result c_aot_compile(const char* source, size_t source_size, const char* c_compiler, const char* const* compiler_args) {
-  struct c_aot_compile_result result;
-  result.type = C_AOT_COMPILE_ERR;
-  result.value.error_msg = NULL;
-  result.code_fd = -1;
+#ifdef C_AOT_MEMORY_FILES
+// an anonymous file in memory (close-on-exec), or -1 if the kernel has none
+static int c_aot_memfd(const char* name) {
+#if defined(__GLIBC__) && !__GLIBC_PREREQ(2, 27)
+  return (int)syscall(SYS_memfd_create, name, 1u); // MFD_CLOEXEC
+#else
+  return memfd_create(name, 1u); // MFD_CLOEXEC
+#endif
+}
 
-  if (!c_compiler) {
-    c_compiler = "cc";
+// dlopen the file behind fd (a memory file). the loader names a library by
+// the path it was opened with and hands back the library already loaded under
+// that name, so a name used before (an fd number reused while an earlier
+// library is still mapped, because dlclose doesn't always unload) can't be
+// used again: "./" components make a new name for the same file
+static void* c_aot_dlopen_fd(int fd, char* reason, size_t reason_size) {
+  for (int extra = 0; extra < 64; ++extra) {
+    char path[256];
+    int n = snprintf(path, sizeof(path), "/proc/self/fd/");
+    for (int i = 0; i < extra; ++i) {
+      n += snprintf(path + n, sizeof(path) - (size_t)n, "./");
+    }
+    snprintf(path + n, sizeof(path) - (size_t)n, "%d", fd);
+    void* taken = dlopen(path, RTLD_NOW | RTLD_NOLOAD);
+    if (taken) {
+      dlclose(taken);
+      continue;
+    }
+    void* handle = dlopen(path, RTLD_NOW);
+    if (!handle) {
+      const char* why = dlerror();
+      snprintf(reason, reason_size, "dlopen: %s", why ? why : "unknown error");
+    }
+    return handle;
   }
+  snprintf(reason, reason_size, "dlopen: no unused name for the library");
+  return NULL;
+}
+#endif // C_AOT_MEMORY_FILES
+
+static struct c_aot_compile_result c_aot_compile_exec(const char* source, size_t source_size, const char* c_compiler, const char* const* compiler_args) {
+  struct c_aot_compile_result result;
+  c_aot_result_init(&result);
+
   static const char* const no_args[] = {NULL};
   if (!compiler_args) {
     compiler_args = no_args;
@@ -645,6 +995,7 @@ static struct c_aot_compile_result c_aot_compile(const char* source, size_t sour
   int lib_fd = -1;            // the library, once compiled
   int err_pipe[2] = {-1, -1}; // compiler's stderr
   char** argv = NULL;
+  char** envp = NULL; // the child's environment, if it isn't ours
   pid_t pid = 0; // nonzero while the child is unreaped
   posix_spawn_file_actions_t actions;
   bool actions_init = false;
@@ -652,10 +1003,30 @@ static struct c_aot_compile_result c_aot_compile(const char* source, size_t sour
   char tmp_dir[PATH_MAX]; // private temp directory, removed at the end
   bool tmp_dir_made = false;
   char src_path[PATH_MAX]; // inside tmp_dir
-  char lib_path[PATH_MAX]; // inside tmp_dir
+  char lib_path[PATH_MAX]; // inside tmp_dir, or what the compiler is told to write to
 
-  {
-    const char* base = getenv("TMPDIR");
+  // linux: the source and the library are memory files, so neither touches
+  // disk. the compiler writes the library to its stdout, a memory file, by
+  // the path /dev/fd/1. (what a compiler itself writes to TMPDIR is its own
+  // business.) elsewhere, or if the kernel has no memory files, a private
+  // temp directory holds them
+  bool in_memory = false;
+  int mem_lib_fd = -1; // the library's memory file, the compiler's stdout
+#ifdef C_AOT_MEMORY_FILES
+  src_fd = c_aot_fd_high(c_aot_memfd("c_aot_source"));
+  mem_lib_fd = c_aot_fd_high(c_aot_memfd("c_aot_library"));
+  in_memory = src_fd != -1 && mem_lib_fd != -1 && access("/dev/fd/0", F_OK) == 0;
+  if (!in_memory) {
+    if (src_fd != -1) close(src_fd);
+    if (mem_lib_fd != -1) close(mem_lib_fd);
+    src_fd = mem_lib_fd = -1;
+  }
+#endif
+
+  if (in_memory) {
+    snprintf(lib_path, sizeof(lib_path), "/dev/fd/1");
+  } else {
+    const char* base = c_aot_getenv("TMPDIR");
     if (!base || !base[0]) {
       base = "/tmp";
     }
@@ -694,7 +1065,7 @@ static struct c_aot_compile_result c_aot_compile(const char* source, size_t sour
   argv[1] = (char*)"-pipe"; // fewer intermediate files
   argv[2] = (char*)"-fPIC";
   argv[3] = (char*)"-shared";
-  argv[4] = (char*)"-O2";
+  argv[4] = (char*)"-O1"; // modest. later args win, so -O2 or -O0 in the candidate's args overrides it
   argv[5] = (char*)"-xc"; // stdin is c
   argv[6] = (char*)"-o";
   argv[7] = lib_path;
@@ -704,13 +1075,16 @@ static struct c_aot_compile_result c_aot_compile(const char* source, size_t sour
   }
   argv[9 + num_extra] = NULL;
 
-  // source -> file, unlinked at once, which becomes the compiler's stdin
-  src_fd = c_aot_fd_high(open(src_path, O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600));
-  if (src_fd == -1) {
-    c_aot_set_err(&result, "creating source file: %s\n", C_AOT_ERRNO);
-    goto end;
+  // source -> a file (in memory, or unlinked at once), which becomes the
+  // compiler's stdin
+  if (!in_memory) {
+    src_fd = c_aot_fd_high(open(src_path, O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600));
+    if (src_fd == -1) {
+      c_aot_set_err(&result, "creating source file: %s\n", C_AOT_ERRNO);
+      goto end;
+    }
+    unlink(src_path);
   }
-  unlink(src_path);
   if (!c_aot_write_all(src_fd, source, source_size) || lseek(src_fd, 0, SEEK_SET) == -1) {
     c_aot_set_err(&result, "writing source: %s\n", C_AOT_ERRNO);
     goto end;
@@ -731,7 +1105,8 @@ static struct c_aot_compile_result c_aot_compile(const char* source, size_t sour
     goto end;
   }
 
-  // wire up the child: stdin = source, stdout = /dev/null, stderr = pipe.
+  // wire up the child: stdin = source, stdout = the library's memory file or
+  // /dev/null, stderr = pipe.
   // (all our fds are close-on-exec; dup2 clears it on the new numbers)
   if ((rc = posix_spawn_file_actions_init(&actions)) != 0) {
     errno = rc;
@@ -741,13 +1116,35 @@ static struct c_aot_compile_result c_aot_compile(const char* source, size_t sour
   actions_init = true;
   if ((rc = posix_spawn_file_actions_adddup2(&actions, src_fd, STDIN_FILENO)) != 0 ||       //
       (rc = posix_spawn_file_actions_adddup2(&actions, err_pipe[1], STDERR_FILENO)) != 0 || //
-      (rc = posix_spawn_file_actions_addopen(&actions, STDOUT_FILENO, "/dev/null", O_WRONLY, 0)) != 0) {
+      (rc = in_memory ? posix_spawn_file_actions_adddup2(&actions, mem_lib_fd, STDOUT_FILENO)
+                      : posix_spawn_file_actions_addopen(&actions, STDOUT_FILENO, "/dev/null", O_WRONLY, 0)) != 0) {
     errno = rc;
     c_aot_set_err(&result, "posix_spawn_file_actions: %s\n", C_AOT_ERRNO);
     goto end;
   }
 
-  if ((rc = posix_spawnp(&pid, c_compiler, &actions, NULL, argv, c_aot_environ())) != 0) {
+  // the compiler's own temporary files (gcc leaves intermediate files even with
+  // -pipe) go where TMPDIR says. with a temp directory, that is the private
+  // directory, so they are contained and removed with it. with memory files
+  // (linux), it is /dev/shm, a memory file system, even if the caller set
+  // TMPDIR: the point of memory files is to stay off disk
+  const char* child_tmpdir = NULL;
+  if (in_memory) {
+    if (c_aot_is_writable_dir("/dev/shm")) {
+      child_tmpdir = "/dev/shm";
+    }
+  } else {
+    child_tmpdir = tmp_dir;
+  }
+  if (child_tmpdir) {
+    envp = c_aot_environ_with("TMPDIR", child_tmpdir);
+    if (!envp) {
+      c_aot_set_err(&result, "out of memory\n");
+      goto end;
+    }
+  }
+
+  if ((rc = posix_spawnp(&pid, c_compiler, &actions, NULL, argv, envp ? envp : c_aot_environ())) != 0) {
     pid = 0; // not started
     errno = rc;
     c_aot_set_err(&result, "starting compiler \"%s\": %s\n", c_compiler, C_AOT_ERRNO);
@@ -810,22 +1207,41 @@ static struct c_aot_compile_result c_aot_compile(const char* source, size_t sour
 
   // hold the library's inode while it's loaded, so it can't be reused for a
   // later library while this one is still loaded
-  lib_fd = c_aot_fd_high(open(lib_path, O_RDONLY | O_CLOEXEC));
-  if (lib_fd == -1) {
-    c_aot_set_err(&result, "opening library: %s\n", C_AOT_ERRNO);
-    goto end;
+  if (in_memory) {
+    lib_fd = mem_lib_fd;
+    mem_lib_fd = -1;
+  } else {
+    lib_fd = c_aot_fd_high(open(lib_path, O_RDONLY | O_CLOEXEC));
+    if (lib_fd == -1) {
+      c_aot_set_err(&result, "opening library: %s\n", C_AOT_ERRNO);
+      goto end;
+    }
   }
 
   {
-    void* handle = dlopen(lib_path, RTLD_NOW); // random directory, so unique
-    if (!handle) {
-      const char* reason = dlerror();
-      c_aot_set_err(&result, "dlopen: %s\n", reason ? reason : "unknown error");
-      goto end;
+    void* handle;
+#ifdef C_AOT_MEMORY_FILES
+    if (in_memory) {
+      char reason[256];
+      handle = c_aot_dlopen_fd(lib_fd, reason, sizeof(reason));
+      if (!handle) {
+        c_aot_set_err(&result, "%s\n", reason);
+        goto end;
+      }
+    } else
+#endif
+    {
+      handle = dlopen(lib_path, RTLD_NOW); // random directory, so unique
+      if (!handle) {
+        const char* reason = dlerror();
+        c_aot_set_err(&result, "dlopen: %s\n", reason ? reason : "unknown error");
+        goto end;
+      }
     }
     result.type = C_AOT_COMPILE_OK;
-    result.value.dl_handle = handle;
-    result.code_fd = lib_fd; // ownership moves to the result
+    result.value.code.type = C_AOT_CODE_LIBRARY;
+    result.value.code.value.library.handle = handle;
+    result.value.code.value.library.fd = lib_fd; // ownership moves to the result
     lib_fd = -1;
   }
 
@@ -838,6 +1254,7 @@ end:
   if (err_pipe[1] != -1) close(err_pipe[1]);
   if (src_fd != -1) close(src_fd);
   if (lib_fd != -1) close(lib_fd);
+  if (mem_lib_fd != -1) close(mem_lib_fd);
   if (pid != 0) {
     while (waitpid(pid, NULL, 0) == -1 && errno == EINTR) {}
   }
@@ -850,7 +1267,714 @@ end:
     c_aot_remove_dir(tmp_dir);
   }
   free(argv);
+  free(envp);
   return result;
 }
 
 #endif // _WIN32
+
+// ================================ tcc ==================================
+
+#ifdef _WIN32
+static SRWLOCK c_aot_tcc_mutex = SRWLOCK_INIT;
+static void c_aot_tcc_lock(void) { AcquireSRWLockExclusive(&c_aot_tcc_mutex); }
+static void c_aot_tcc_unlock(void) { ReleaseSRWLockExclusive(&c_aot_tcc_mutex); }
+#else
+static pthread_mutex_t c_aot_tcc_mutex = PTHREAD_MUTEX_INITIALIZER;
+static void c_aot_tcc_lock(void) { pthread_mutex_lock(&c_aot_tcc_mutex); }
+static void c_aot_tcc_unlock(void) { pthread_mutex_unlock(&c_aot_tcc_mutex); }
+#endif
+
+enum { C_AOT_TCC_OUTPUT_MEMORY = 1 };
+enum { C_AOT_EXE_PATH_MAX = 1024 };
+
+struct c_aot_tcc_errors {
+  char text[C_AOT_STDERR_CAPACITY];
+  size_t size;
+};
+
+// libtcc's error callback: keeps the first bytes of what it reports
+static void c_aot_tcc_on_error(void* opaque, const char* message) {
+  struct c_aot_tcc_errors* errors = opaque;
+  size_t room = sizeof(errors->text) - errors->size - 1;
+  size_t take = strlen(message);
+  if (take > room) take = room;
+  memcpy(errors->text + errors->size, message, take);
+  errors->size += take;
+  if (errors->size < sizeof(errors->text) - 1) {
+    errors->text[errors->size++] = '\n';
+  }
+  errors->text[errors->size] = '\0';
+}
+
+static struct c_aot_compile_result c_aot_compile_tcc(const struct c_aot_compiler* compiler, const char* source, size_t source_size) {
+  struct c_aot_compile_result result;
+  c_aot_result_init(&result);
+  if (memchr(source, '\0', source_size)) {
+    c_aot_set_err(&result, "source contains a NUL byte\n");
+    return result;
+  }
+  char* text = malloc(source_size + 1); // tcc wants a C string
+  if (!text) {
+    c_aot_set_err(&result, "out of memory\n");
+    return result;
+  }
+  memcpy(text, source, source_size);
+  text[source_size] = '\0';
+
+  const struct c_aot_tcc_api* tcc = &compiler->value.tcc.api;
+  struct c_aot_tcc_errors errors;
+  errors.size = 0;
+  errors.text[0] = '\0';
+  bool ok = false;
+
+  c_aot_tcc_lock();
+  void* state = tcc->tcc_new();
+  if (!state) {
+    c_aot_set_err(&result, "tcc_new failed\n");
+  } else {
+    tcc->tcc_set_error_func(state, &errors, c_aot_tcc_on_error);
+    if (compiler->value.tcc.support_dir) {
+      tcc->tcc_set_lib_path(state, compiler->value.tcc.support_dir);
+    }
+    bool output_set = tcc->tcc_set_output_type(state, C_AOT_TCC_OUTPUT_MEMORY) >= 0;
+    // the candidate's configure function sets options on the state, as a
+    // compiler program gets the candidate's args
+    int configured = 0;
+    if (output_set && compiler->value.tcc.configure) {
+      configured = compiler->value.tcc.configure(state, tcc, compiler->value.tcc.configure_user_data);
+    }
+    if (!output_set) {
+      c_aot_set_err(&result, "tcc: tcc_set_output_type failed\n");
+    } else if (configured != 0) {
+      c_aot_set_err(&result, "tcc: the configure function stopped the compile (returned %d). diagnostics:\n%s", configured, errors.text);
+    } else if (tcc->tcc_compile_string(state, text) < 0 || tcc->tcc_relocate(state, (void*)1 /* TCC_RELOCATE_AUTO */) < 0) {
+      c_aot_set_err(&result, "tcc failed. diagnostics:\n%s", errors.text);
+    } else {
+      ok = true;
+    }
+    if (ok) {
+      // the state lives on in the result, `errors` doesn't: nothing may report to it
+      tcc->tcc_set_error_func(state, NULL, NULL);
+    } else {
+      tcc->tcc_delete(state);
+    }
+  }
+  c_aot_tcc_unlock();
+  free(text);
+
+  if (ok) {
+    result.type = C_AOT_COMPILE_OK;
+    result.value.code.type = C_AOT_CODE_TCC;
+    result.value.code.value.tcc.api = tcc;
+    result.value.code.value.tcc.state = state;
+  }
+  return result;
+}
+
+// ============================= resolution ==============================
+
+// a growing string
+struct c_aot_text {
+  char* data; // NULL until something is added
+  size_t size;
+  bool failed; // out of memory
+};
+
+static void c_aot_text_add(struct c_aot_text* text, const char* format, ...) {
+  va_list args, args_again;
+  va_start(args, format);
+  va_copy(args_again, args);
+  int needed = vsnprintf(NULL, 0, format, args);
+  va_end(args);
+  if (needed >= 0 && !text->failed) {
+    char* grown = realloc(text->data, text->size + (size_t)needed + 1);
+    if (grown) {
+      vsnprintf(grown + text->size, (size_t)needed + 1, format, args_again);
+      text->data = grown;
+      text->size += (size_t)needed;
+    } else {
+      text->failed = true;
+    }
+  }
+  va_end(args_again);
+}
+
+static char* c_aot_copy(const char* s) {
+  size_t n = strlen(s) + 1;
+  char* copy = malloc(n);
+  if (copy) memcpy(copy, s, n);
+  return copy;
+}
+
+#ifdef _WIN32
+#define C_AOT_DIR_SEPARATORS "/\\:"
+#define C_AOT_PATH_LIST_SEPARATOR ';'
+#else
+#define C_AOT_DIR_SEPARATORS "/"
+#define C_AOT_PATH_LIST_SEPARATOR ':'
+#endif
+
+// like a shell: a name with a directory separator is a path, not searched
+static bool c_aot_has_dir_separator(const char* s) { return strpbrk(s, C_AOT_DIR_SEPARATORS) != NULL; }
+
+static bool c_aot_is_file(const char* path) {
+#ifdef _WIN32
+  DWORD attributes = GetFileAttributesA(path);
+  return attributes != INVALID_FILE_ATTRIBUTES && !(attributes & FILE_ATTRIBUTE_DIRECTORY);
+#else
+  struct stat st;
+  return stat(path, &st) == 0 && S_ISREG(st.st_mode) && access(path, X_OK) == 0;
+#endif
+}
+
+// out = path made absolute (symlinks are kept: a compiler may go by the name
+// it was started under, like cc -> clang)
+static bool c_aot_make_absolute(const char* path, char* out, size_t out_size) {
+#ifdef _WIN32
+  DWORD n = GetFullPathNameA(path, (DWORD)out_size, out, NULL);
+  return n > 0 && n < out_size;
+#else
+  if (path[0] == '/') {
+    return snprintf(out, out_size, "%s", path) < (int)out_size;
+  }
+  char cwd[PATH_MAX];
+  return getcwd(cwd, sizeof(cwd)) && snprintf(out, out_size, "%s/%s", cwd, path) < (int)out_size;
+#endif
+}
+
+// out = the executable at path (windows: also path + ".exe"). NULL if found,
+// else why not
+static const char* c_aot_exe_at(const char* path, char* out, size_t out_size) {
+  char candidate[C_AOT_EXE_PATH_MAX];
+#ifdef _WIN32
+  // path.exe first: an extensionless file of the same name next to it (a shell
+  // script, as git bash and msys have) can't be started by CreateProcess
+  if (snprintf(candidate, sizeof(candidate), "%s.exe", path) < (int)sizeof(candidate) && c_aot_is_file(candidate)) {
+    return c_aot_make_absolute(candidate, out, out_size) ? NULL : "path too long";
+  }
+#endif
+  if (snprintf(candidate, sizeof(candidate), "%s", path) >= (int)sizeof(candidate)) {
+    return "path too long";
+  }
+  if (!c_aot_is_file(candidate)) {
+    return "no such executable file";
+  }
+  return c_aot_make_absolute(candidate, out, out_size) ? NULL : "path too long";
+}
+
+// out = the first executable called name in PATH. empty PATH entries (the
+// current directory, in a shell) are skipped on purpose. NULL if found, else why not
+static const char* c_aot_exe_in_path(const char* name, char* out, size_t out_size) {
+  const char* path = c_aot_getenv("PATH");
+  if (!path) {
+    return "PATH is not set";
+  }
+  const char* dir = path;
+  while (*dir) {
+    const char* end = strchr(dir, C_AOT_PATH_LIST_SEPARATOR);
+    size_t len = end ? (size_t)(end - dir) : strlen(dir);
+    const char* entry = dir;
+    size_t entry_len = len;
+#ifdef _WIN32
+    // an entry may be in double quotes ("C:\Program Files\LLVM\bin"): without them
+    if (entry_len >= 2 && entry[0] == '"' && entry[entry_len - 1] == '"') {
+      ++entry;
+      entry_len -= 2;
+    }
+#endif
+    char candidate[C_AOT_EXE_PATH_MAX];
+    if (entry_len && snprintf(candidate, sizeof(candidate), "%.*s/%s", (int)entry_len, entry, name) < (int)sizeof(candidate) &&
+        c_aot_exe_at(candidate, out, out_size) == NULL) {
+      return NULL;
+    }
+    dir = end ? end + 1 : dir + len;
+  }
+  return "not found in PATH";
+}
+
+static const char* c_aot_exe_from_value(const char* value, char* out, size_t out_size) {
+  return c_aot_has_dir_separator(value) ? c_aot_exe_at(value, out, out_size) : c_aot_exe_in_path(value, out, out_size);
+}
+
+static void* c_aot_load_library(const char* name, char* reason, size_t reason_size) {
+#ifdef _WIN32
+  char c_aot_errbuf[C_AOT_ERRBUF_SIZE];
+  void* handle = (void*)LoadLibraryA(name);
+  if (!handle) snprintf(reason, reason_size, "LoadLibrary: %s", C_AOT_ERRNO);
+  return handle;
+#else
+  void* handle = dlopen(name, RTLD_NOW | RTLD_LOCAL);
+  if (!handle) {
+    const char* why = dlerror();
+    snprintf(reason, reason_size, "dlopen: %s", why ? why : "unknown error");
+  }
+  return handle;
+#endif
+}
+
+static void c_aot_unload_library(void* handle) {
+#ifdef _WIN32
+  FreeLibrary((HMODULE)handle);
+#else
+  dlclose(handle);
+#endif
+}
+
+static void* c_aot_library_symbol(void* handle, const char* name) {
+#ifdef _WIN32
+  FARPROC proc = GetProcAddress((HMODULE)handle, name);
+  void* symbol = NULL;
+  memcpy(&symbol, &proc, sizeof(symbol));
+  return symbol;
+#else
+  return dlsym(handle, name);
+#endif
+}
+
+// fills api from the library. returns the name of the first function it's
+// missing, or NULL
+static const char* c_aot_tcc_bind(void* library, struct c_aot_tcc_api* api) {
+  struct slot {
+    const char* name;
+    void* slot; // the address of the function pointer to fill
+  };
+  const struct slot slots[] = {
+      {"tcc_new", &api->tcc_new},
+      {"tcc_delete", &api->tcc_delete},
+      {"tcc_set_lib_path", &api->tcc_set_lib_path},
+      {"tcc_set_error_func", &api->tcc_set_error_func},
+      {"tcc_set_output_type", &api->tcc_set_output_type},
+      {"tcc_add_include_path", &api->tcc_add_include_path},
+      {"tcc_define_symbol", &api->tcc_define_symbol},
+      {"tcc_add_library_path", &api->tcc_add_library_path},
+      {"tcc_add_library", &api->tcc_add_library},
+      {"tcc_compile_string", &api->tcc_compile_string},
+      {"tcc_relocate", &api->tcc_relocate},
+      {"tcc_get_symbol", &api->tcc_get_symbol},
+  };
+  for (size_t i = 0; i < sizeof(slots) / sizeof(slots[0]); ++i) {
+    void* symbol = c_aot_library_symbol(library, slots[i].name);
+    if (!symbol) {
+      return slots[i].name;
+    }
+    memcpy(slots[i].slot, &symbol, sizeof(symbol)); // void* -> function pointer
+  }
+  // the ones an older libtcc may lack stay NULL
+  const struct slot optional[] = {
+      {"tcc_set_options", &api->tcc_set_options},
+      {"tcc_add_sysinclude_path", &api->tcc_add_sysinclude_path},
+      {"tcc_undefine_symbol", &api->tcc_undefine_symbol},
+      {"tcc_add_symbol", &api->tcc_add_symbol},
+      {"tcc_add_file", &api->tcc_add_file},
+  };
+  for (size_t i = 0; i < sizeof(optional) / sizeof(optional[0]); ++i) {
+    void* symbol = c_aot_library_symbol(library, optional[i].name);
+    memcpy(optional[i].slot, &symbol, sizeof(symbol));
+  }
+  return NULL;
+}
+
+// a copy of a NULL terminated list of strings: NULL for an empty or NULL list.
+// false if out of memory
+static bool c_aot_copy_args(const char* const* args, char*** out) {
+  *out = NULL;
+  size_t count = 0;
+  while (args && args[count]) {
+    ++count;
+  }
+  if (count == 0) {
+    return true;
+  }
+  char** copy = calloc(count + 1, sizeof(*copy));
+  if (!copy) {
+    return false;
+  }
+  for (size_t i = 0; i < count; ++i) {
+    copy[i] = c_aot_copy(args[i]);
+    if (!copy[i]) {
+      for (size_t j = 0; j < i; ++j) free(copy[j]);
+      free(copy);
+      return false;
+    }
+  }
+  *out = copy;
+  return true;
+}
+
+static void c_aot_free_args(char** args) {
+  for (size_t i = 0; args && args[i]; ++i) {
+    free(args[i]);
+  }
+  free(args);
+}
+
+// true if path is a regular file (c_aot_is_file also wants it executable)
+static bool c_aot_file_exists(const char* path) {
+#ifdef _WIN32
+  DWORD attributes = GetFileAttributesA(path);
+  return attributes != INVALID_FILE_ATTRIBUTES && !(attributes & FILE_ATTRIBUTE_DIRECTORY);
+#else
+  struct stat st;
+  return stat(path, &st) == 0 && S_ISREG(st.st_mode);
+#endif
+}
+
+// the directory of the libtcc at library_path, if tcc's support files are in
+// it (libtcc1.a, or lib/libtcc1.a as on windows): malloc'd. else NULL (also
+// for a bare name, whose directory isn't known): tcc then uses its own
+// built-in location, which is right for an installed tcc
+static char* c_aot_tcc_neighbors(const char* library_path) {
+  if (!c_aot_has_dir_separator(library_path)) {
+    return NULL;
+  }
+  size_t dir_len = strlen(library_path);
+  while (dir_len > 0 && !strchr(C_AOT_DIR_SEPARATORS, library_path[dir_len - 1])) --dir_len;
+  // drop the trailing separator, except where that changes what the directory
+  // is: the root "/", a drive root "C:\" ("C:" alone is that drive's current
+  // directory), or a drive prefix "C:" itself
+  bool drive_root = dir_len == 3 && library_path[1] == ':';
+  if (dir_len > 1 && library_path[dir_len - 1] != ':' && !drive_root) --dir_len;
+  char probe[C_AOT_EXE_PATH_MAX];
+  static const char* const names[] = {"%.*s/libtcc1.a", "%.*s/lib/libtcc1.a"};
+  for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); ++i) {
+    if (snprintf(probe, sizeof(probe), names[i], (int)dir_len, library_path) < (int)sizeof(probe) && c_aot_file_exists(probe)) {
+      char* dir = malloc(dir_len + 1);
+      if (dir) {
+        memcpy(dir, library_path, dir_len);
+        dir[dir_len] = '\0';
+      }
+      return dir;
+    }
+  }
+  return NULL;
+}
+
+// compiles something tiny with compiler, to know it works. appends why not to
+// text (indented) and returns false if it doesn't
+static bool c_aot_probe(const struct c_aot_compiler* compiler, struct c_aot_text* text) {
+  // stddef.h: tcc needs its support files (include/) for it
+#ifdef _WIN32
+  static const char probe[] = "#include <stddef.h>\n__declspec(dllexport) size_t c_aot_probe(void) { return 1; }\n";
+#else
+  static const char probe[] = "#include <stddef.h>\nsize_t c_aot_probe(void) { return 1; }\n";
+#endif
+  struct c_aot_compile_result result;
+  if (compiler->type == C_AOT_COMPILER_TCC) {
+    result = c_aot_compile_tcc(compiler, probe, sizeof(probe) - 1);
+  } else {
+    result = c_aot_compile_exec(probe, sizeof(probe) - 1, compiler->value.executable.path, (const char* const*)compiler->value.executable.args);
+  }
+  bool ok = result.type == C_AOT_COMPILE_OK && c_aot_compile_symbol(&result, "c_aot_probe") != NULL;
+  if (!ok) {
+    const char* message = result.type == C_AOT_COMPILE_ERR && result.value.error_msg ? result.value.error_msg : "the test program compiled, but its symbol wasn't found\n";
+    c_aot_text_add(text, "failed to compile a test program: ");
+    // indent the lines of the message
+    for (const char* line = message; *line;) {
+      const char* nl = strchr(line, '\n');
+      size_t n = nl ? (size_t)(nl - line) : strlen(line);
+      if (n) c_aot_text_add(text, "\n      %.*s", (int)n, line);
+      line += n + (nl ? 1 : 0);
+    }
+  }
+  c_aot_compile_result_destroy(&result);
+  return ok;
+}
+
+enum { C_AOT_PRESET_CANDIDATES_MAX = 12 };
+
+// the memory first preset: the candidates to try when keeping source and
+// compiled code in memory matters most, then speed. writes them to out (room for
+// C_AOT_PRESET_CANDIDATES_MAX) and returns how many. it is a priority, not a
+// guarantee: where only a compiler program that writes temporary files exists
+// (macos or windows without a libtcc) that program is still used, last. what
+// writes nothing: libtcc, and on linux the compilers below, whose source and
+// library are memory files and whose own temporary files go to /dev/shm. the
+// order:
+// - linux: $CC, then cc, gcc, clang (their source and library are memory
+//   files: nothing touches disk), then your libtcc as the fallback, then tcc as
+//   a program, last.
+// - elsewhere (macos, windows, other unix): your libtcc first (the only option
+//   that never touches disk there), then tcc as a program (it compiles
+//   fastest), then $CC, then cc, gcc, clang (windows: gcc, clang, cc).
+// - with C_AOT_NO_MEMORY_FILES on linux: as "elsewhere", except that tcc as a
+//   program stays last, as on linux.
+// why tcc as a program is last on linux: the libraries it builds have no
+// PT_GNU_STACK header, which the loader reads as "needs an executable stack",
+// and glibc 2.41 and later refuse to dlopen such a library (older glibc made the
+// stack executable instead). it is still a candidate because that glibc may be
+// older, and where it isn't, resolving fails it with the loader's own message
+// and moves on, so it costs nothing but a test compile at the end of the list.
+// libtcc, in process, has no such problem. see the README
+// tcc_library: a libtcc you ship (a path, or a bare name for the loader), or
+// NULL for none. this lib never looks for one: you provide it. to give it a
+// configure function, set value.tcc_library.configure of the candidate of type
+// C_AOT_CANDIDATE_TCC_LIBRARY in out afterwards
+static inline size_t c_aot_memory_first_candidates(struct c_aot_candidate* out, const char* tcc_library) {
+#ifdef _WIN32
+  static const char* const names[] = {"gcc", "clang", "cc"};
+#else
+  static const char* const names[] = {"cc", "gcc", "clang"};
+#endif
+  size_t n = 0;
+#ifdef C_AOT_MEMORY_FILES
+  // the system compilers keep nothing on disk: they come first
+  out[n++] = c_aot_candidate_env("CC", NULL);
+  for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); ++i) {
+    out[n++] = c_aot_candidate_executable(names[i], NULL);
+  }
+  if (tcc_library) {
+    out[n++] = c_aot_candidate_tcc_library(tcc_library, NULL, NULL);
+  }
+#else
+  // only libtcc keeps nothing on disk: it comes first
+  if (tcc_library) {
+    out[n++] = c_aot_candidate_tcc_library(tcc_library, NULL, NULL);
+  }
+#ifndef __linux__
+  out[n++] = c_aot_candidate_executable("tcc", NULL);
+#endif
+  out[n++] = c_aot_candidate_env("CC", NULL);
+  for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); ++i) {
+    out[n++] = c_aot_candidate_executable(names[i], NULL);
+  }
+#endif
+#ifdef __linux__
+  out[n++] = c_aot_candidate_executable("tcc", NULL); // last, see above
+#endif
+  return n;
+}
+
+// frees what a compiler owns. users free it through its c_aot_resolve_result
+static void c_aot_compiler_free(struct c_aot_compiler* compiler) {
+  switch (compiler->type) {
+  case C_AOT_COMPILER_EXECUTABLE:
+    free(compiler->value.executable.path);
+    c_aot_free_args(compiler->value.executable.args);
+    break;
+  case C_AOT_COMPILER_TCC:
+    free(compiler->value.tcc.support_dir);
+    c_aot_unload_library(compiler->value.tcc.library);
+    break;
+  }
+}
+
+// ok: frees the compiler (and unloads libtcc, if that's what it is), after
+// which every result made with it must already be destroyed. err: frees the
+// message. the result must not be used afterwards.
+static inline void c_aot_resolve_result_destroy(struct c_aot_resolve_result* result) {
+  if (result->type == C_AOT_RESOLVE_OK) {
+    c_aot_compiler_free(&result->value.compiler);
+  } else {
+    free(result->value.error_msg);
+  }
+  result->type = C_AOT_RESOLVE_ERR;
+  result->value.error_msg = NULL;
+}
+
+// tries the candidates in order and returns the first that works: an
+// executable that compiles a test program, or a libtcc that does. nothing is
+// searched beyond the candidates (so "only tcc" is a list of one tcc library).
+// if none works, the result is an error that says why, for each.
+// resolving is not cheap (it compiles a test program), so do it once
+static inline struct c_aot_resolve_result c_aot_compiler_resolve(const struct c_aot_candidate* candidates, size_t count) {
+  struct c_aot_compiler compiler;
+  memset(&compiler, 0, sizeof(compiler)); // only read once found
+  bool found = false;
+  struct c_aot_text report = {NULL, 0, false};
+  c_aot_text_add(&report, "no working compiler. tried:");
+
+  for (size_t i = 0; i < count && !found; ++i) {
+    const struct c_aot_candidate* c = &candidates[i];
+    // what the candidate names, and its args (an executable or an environment variable)
+    const char* named = NULL;
+    const char* const* args = NULL;
+    const char* kind = NULL;
+    switch (c->type) {
+    case C_AOT_CANDIDATE_EXECUTABLE:
+      kind = "executable";
+      named = c->value.executable.compiler_exe_path_or_name;
+      args = c->value.executable.args;
+      break;
+    case C_AOT_CANDIDATE_ENV:
+      kind = "environment variable";
+      named = c->value.env.variable;
+      args = c->value.env.args;
+      break;
+    case C_AOT_CANDIDATE_TCC_LIBRARY:
+      kind = "tcc library";
+      named = c->value.tcc_library.library_path_or_name;
+      break;
+    }
+    c_aot_text_add(&report, "\n  %lu. %s \"%s\": ", (unsigned long)(i + 1), kind, named);
+
+    if (c->type == C_AOT_CANDIDATE_TCC_LIBRARY) {
+      char reason[512];
+      void* library = c_aot_load_library(named, reason, sizeof(reason));
+      if (!library) {
+        c_aot_text_add(&report, "%s", reason);
+        continue;
+      }
+      struct c_aot_compiler attempt;
+      memset(&attempt, 0, sizeof(attempt));
+      attempt.type = C_AOT_COMPILER_TCC;
+      struct c_aot_compiler_tcc* tcc = &attempt.value.tcc;
+      tcc->library = library;
+      tcc->configure = c->value.tcc_library.configure;
+      tcc->configure_user_data = c->value.tcc_library.user_data;
+      const char* missing = c_aot_tcc_bind(library, &tcc->api);
+      if (missing) {
+        c_aot_text_add(&report, "not a usable libtcc: no %s", missing);
+      } else {
+        tcc->support_dir = c_aot_tcc_neighbors(named);
+        attempt.candidate = i;
+        if (c_aot_probe(&attempt, &report)) {
+          compiler = attempt;
+          found = true;
+          continue;
+        }
+        free(tcc->support_dir);
+      }
+      c_aot_unload_library(library);
+      continue;
+    }
+
+    // an executable: named directly, or by an environment variable
+    const char* value = named;
+    char exe[C_AOT_EXE_PATH_MAX];
+    const char* why = NULL;
+    if (c->type == C_AOT_CANDIDATE_ENV) {
+      value = c_aot_getenv(named);
+      if (!value || !value[0]) {
+        c_aot_text_add(&report, "not set");
+        continue;
+      }
+      c_aot_text_add(&report, "set to \"%s\": ", value);
+    }
+    why = c_aot_exe_from_value(value, exe, sizeof(exe));
+    if (why) {
+      c_aot_text_add(&report, "%s", why);
+      if (strpbrk(value, " \t")) {
+        c_aot_text_add(&report, " (note: arguments aren't supported, it must be a program only)");
+      }
+      continue;
+    }
+    struct c_aot_compiler attempt;
+    memset(&attempt, 0, sizeof(attempt));
+    attempt.type = C_AOT_COMPILER_EXECUTABLE;
+    attempt.value.executable.path = c_aot_copy(exe);
+    attempt.candidate = i;
+    if (!attempt.value.executable.path || !c_aot_copy_args(args, &attempt.value.executable.args)) {
+      c_aot_text_add(&report, "out of memory");
+    } else if (c_aot_probe(&attempt, &report)) {
+      compiler = attempt;
+      found = true;
+      continue;
+    }
+    free(attempt.value.executable.path);
+    c_aot_free_args(attempt.value.executable.args);
+  }
+
+  struct c_aot_resolve_result result;
+  if (found) {
+    free(report.data);
+    result.type = C_AOT_RESOLVE_OK;
+    result.value.compiler = compiler;
+  } else {
+    if (count == 0) {
+      c_aot_text_add(&report, " nothing (no candidates)");
+    }
+    c_aot_text_add(&report, "\n");
+    result.type = C_AOT_RESOLVE_ERR;
+    result.value.error_msg = report.failed ? NULL : report.data;
+    if (report.failed) free(report.data);
+  }
+  return result;
+}
+
+// the fast preset: the candidates to try when you want the fastest generated
+// code, whatever it costs. writes them to out (room for C_AOT_PRESET_CANDIDATES_MAX) and returns
+// how many. the system compilers, each first with "go fast" args, and then
+// without them if it turns out to reject them: $CC, then cc, gcc, clang
+// (windows: gcc, clang, cc). then your libtcc, and then tcc as a program, last:
+// tcc doesn't optimize (and on linux, its libraries may not load: see
+// c_aot_memory_first_candidates). the args are -O2 (over the default -O1),
+// -march=native (this machine's instructions; the code is built here and runs
+// here) and -fno-semantic-interposition (calls inside the library are direct).
+// not included, because they change what a program means or remove protection:
+// -ffast-math, -DNDEBUG, -fno-stack-protector. add them with
+// a candidate's args if you want them. compiling takes longer.
+// tcc_library: a libtcc you ship, or NULL for none
+static inline size_t c_aot_fast_candidates(struct c_aot_candidate* out, const char* tcc_library) {
+  static const char* const fast[] = {"-O2", "-march=native", "-fno-semantic-interposition", NULL};
+#ifdef _WIN32
+  static const char* const names[] = {"gcc", "clang", "cc"};
+#else
+  static const char* const names[] = {"cc", "gcc", "clang"};
+#endif
+  size_t n = 0;
+  out[n++] = c_aot_candidate_env("CC", fast);
+  out[n++] = c_aot_candidate_env("CC", NULL);
+  for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); ++i) {
+    out[n++] = c_aot_candidate_executable(names[i], fast);
+    out[n++] = c_aot_candidate_executable(names[i], NULL);
+  }
+  if (tcc_library) {
+    out[n++] = c_aot_candidate_tcc_library(tcc_library, NULL, NULL);
+  }
+  out[n++] = c_aot_candidate_executable("tcc", NULL);
+  return n;
+}
+
+// c_aot_compiler_resolve with c_aot_fast_candidates. tcc_library: a libtcc you
+// ship, or NULL
+static inline struct c_aot_resolve_result c_aot_compiler_resolve_fast(const char* tcc_library) {
+  struct c_aot_candidate candidates[C_AOT_PRESET_CANDIDATES_MAX];
+  size_t count = c_aot_fast_candidates(candidates, tcc_library);
+  return c_aot_compiler_resolve(candidates, count);
+}
+
+// c_aot_compiler_resolve with c_aot_memory_first_candidates. tcc_library: a libtcc
+// you ship, or NULL
+static inline struct c_aot_resolve_result c_aot_compiler_resolve_memory_first(const char* tcc_library) {
+  struct c_aot_candidate candidates[C_AOT_PRESET_CANDIDATES_MAX];
+  size_t count = c_aot_memory_first_candidates(candidates, tcc_library);
+  return c_aot_compiler_resolve(candidates, count);
+}
+
+// ================================ api ==================================
+
+// compiles the c source in source[0, source_size) and loads it. the source
+// need not be NUL terminated.
+//
+// compiler: the compiler of an ok c_aot_resolve_result. it must outlive the
+//   result. an executable compiles to a shared library in a private
+//   temporary directory; tcc compiles in this process, to memory.
+//
+// there are no args here: what a compiler is given is part of its candidate
+// (extra args for a program, a configure function for tcc). to vary something
+// per compile, put it in the source (a #define line).
+//
+// warning! this is a JIT: an avenue for arbitrary code execution. the source
+// and the compiler must be trusted/constant. also:
+// - the environment is passed to the compiler as it is, except TMPDIR on unix
+//   (see the top of this file). variables such as
+//   GCC_EXEC_PREFIX, COMPILER_PATH, CPATH, LIBRARY_PATH, LD_PRELOAD change
+//   what it runs or includes. resolving reads PATH, and any environment
+//   variable candidate you give it (both presets: CC).
+// - compiler diagnostics are returned in the error message; with outside
+//   influenced source, #include "/secret" can leak file fragments through it.
+// - SIGCHLD must not be ignored / children not reaped elsewhere (waitpid would
+//   fail with ECHILD).
+static struct c_aot_compile_result c_aot_compile(const struct c_aot_compiler* compiler, const char* source, size_t source_size) {
+  switch (compiler->type) {
+  case C_AOT_COMPILER_EXECUTABLE:
+    return c_aot_compile_exec(source, source_size, compiler->value.executable.path, (const char* const*)compiler->value.executable.args);
+  case C_AOT_COMPILER_TCC:
+    return c_aot_compile_tcc(compiler, source, source_size);
+  }
+  struct c_aot_compile_result result; // every type is handled above
+  c_aot_result_init(&result);
+  c_aot_set_err(&result, "invalid compiler type\n");
+  return result;
+}
