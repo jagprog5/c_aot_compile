@@ -17,7 +17,7 @@ int main(void) {
 #ifndef MUST_BE_DEFINED2\n\
     #error arg pass failure\n\
 #endif\n\
-int add(int a, int b) {return a + b;}";
+C_AOT_EXPORT int add(int a, int b) {return a + b;}";
 
     // ================= IMPORTANT LINES HERE ================
     // find a compiler once, and keep it. a compiler's args belong to its

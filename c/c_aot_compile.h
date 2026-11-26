@@ -22,10 +22,13 @@
  *
  * design of the executable backend (each point removes a class of bugs).
  * the compiler is run as:
- *   <compiler> -pipe -fPIC -shared -O1 -xc -o <library> - <candidate's args>
+ *   <compiler> -pipe -fPIC -shared -O1 -DC_AOT_EXPORT=... -xc -o <library> - <candidate's args>
  * (no -fPIC on windows). the candidate's args come last, so a later -O2 or -O0
- * overrides
- * the -O1.
+ * overrides the -O1. C_AOT_EXPORT is defined in every compile (libtcc too):
+ * mark what your code must export with it, as in
+ *   C_AOT_EXPORT int f(void) { return 1; }
+ * it is __declspec(dllexport) on windows (which toolchains other than mingw
+ * gcc need), and nothing elsewhere.
  * - the source is a file, which is the compiler's stdin: no pipe to feed, so
  *   no deadlock, short write or SIGPIPE handling.
  * - the compiler writes the library to a file, and the library's fd is kept
@@ -81,7 +84,9 @@
  *   the library is named lib.dll. -fPIC isn't passed.
  * - symbols must be exported to be found: mingw gcc exports every global
  *   symbol unless something is marked dllexport; clang (msvc target) and
- *   others need __declspec(dllexport) on what you look up.
+ *   others need __declspec(dllexport) on what you look up. C_AOT_EXPORT (see
+ *   above) is that on windows, and nothing elsewhere: use it and the same
+ *   source works everywhere.
  * - paths are handled in the ANSI code page, limited to MAX_PATH.
  * - use c_aot_compile_symbol instead of dlsym.
  */
@@ -191,7 +196,8 @@ enum c_aot_candidate_type {
 struct c_aot_candidate_executable {
   const char* compiler_exe_path_or_name;
   // extra compiler args: a NULL terminated list, or NULL for none. they come
-  // after the fixed ones (-pipe -fPIC -shared -O1 -xc -o <library> -), so a
+  // after the fixed ones (-pipe -fPIC -shared -O1 -DC_AOT_EXPORT=... -xc -o
+  // <library> -), so a
   // later -O2 overrides the -O1. copied when resolving, so the list need not
   // outlive it
   const char* const* args;
@@ -230,6 +236,15 @@ union c_aot_candidate_value {
 struct c_aot_candidate {
   enum c_aot_candidate_type type;
   union c_aot_candidate_value value;
+  // the test program that proves this candidate works, or NULL for the
+  // built-in one. C source (NUL terminated) that defines
+  //   C_AOT_EXPORT int c_aot_test(void)
+  // resolving compiles it with the candidate, loads it and calls c_aot_test:
+  // it must return 0 (ok) to be accepted; anything else fails the candidate,
+  // and the value is reported. C_AOT_EXPORT, which every compile defines,
+  // exports it on windows too. only used while resolving: it need not outlive
+  // it. the constructors below set NULL: set it on the result afterwards
+  const char* test_source;
 };
 
 // args: NULL terminated, or NULL for none
@@ -238,6 +253,7 @@ static inline struct c_aot_candidate c_aot_candidate_executable(const char* comp
   c.type = C_AOT_CANDIDATE_EXECUTABLE;
   c.value.executable.compiler_exe_path_or_name = compiler_exe_path_or_name;
   c.value.executable.args = args;
+  c.test_source = NULL;
   return c;
 }
 static inline struct c_aot_candidate c_aot_candidate_env(const char* variable, const char* const* args) {
@@ -245,6 +261,7 @@ static inline struct c_aot_candidate c_aot_candidate_env(const char* variable, c
   c.type = C_AOT_CANDIDATE_ENV;
   c.value.env.variable = variable;
   c.value.env.args = args;
+  c.test_source = NULL;
   return c;
 }
 // configure: may be NULL
@@ -254,6 +271,7 @@ static inline struct c_aot_candidate c_aot_candidate_tcc_library(const char* lib
   c.value.tcc_library.library_path_or_name = library_path_or_name;
   c.value.tcc_library.configure = configure;
   c.value.tcc_library.user_data = user_data;
+  c.test_source = NULL;
   return c;
 }
 
@@ -720,13 +738,13 @@ static struct c_aot_compile_result c_aot_compile_exec(const char* source, size_t
     snprintf(lib_path, sizeof(lib_path), "%s\\lib.dll", tmp_dir);
   }
 
-  // command line: 8 fixed + extras
+  // command line: 9 fixed + extras
   {
     size_t num_extra = 0;
     while (compiler_args[num_extra]) {
       ++num_extra;
     }
-    const char* fixed[] = {c_compiler, "-pipe", "-shared", "-O1", "-xc", "-o", lib_path, "-"};
+    const char* fixed[] = {c_compiler, "-pipe", "-shared", "-O1", "-DC_AOT_EXPORT=__declspec(dllexport)", "-xc", "-o", lib_path, "-"};
     const size_t num_fixed = sizeof(fixed) / sizeof(fixed[0]);
     size_t capacity = 1;
     for (size_t i = 0; i < num_fixed + num_extra; ++i) {
@@ -1052,12 +1070,12 @@ static struct c_aot_compile_result c_aot_compile_exec(const char* source, size_t
     memcpy(lib_path + dir_len, "/lib.so", sizeof("/lib.so"));
   }
 
-  // argv: 9 fixed + extras + NULL
+  // argv: 10 fixed + extras + NULL
   size_t num_extra = 0;
   while (compiler_args[num_extra]) {
     ++num_extra;
   }
-  argv = malloc((10 + num_extra) * sizeof(*argv));
+  argv = malloc((11 + num_extra) * sizeof(*argv));
   if (!argv) {
     c_aot_set_err(&result, "out of memory\n");
     goto end;
@@ -1067,14 +1085,15 @@ static struct c_aot_compile_result c_aot_compile_exec(const char* source, size_t
   argv[2] = (char*)"-fPIC";
   argv[3] = (char*)"-shared";
   argv[4] = (char*)"-O1"; // modest. later args win, so -O2 or -O0 in the candidate's args overrides it
-  argv[5] = (char*)"-xc"; // stdin is c
-  argv[6] = (char*)"-o";
-  argv[7] = lib_path;
-  argv[8] = (char*)"-"; // source is stdin only
+  argv[5] = (char*)"-DC_AOT_EXPORT="; // see the top of this header
+  argv[6] = (char*)"-xc"; // stdin is c
+  argv[7] = (char*)"-o";
+  argv[8] = lib_path;
+  argv[9] = (char*)"-"; // source is stdin only
   for (size_t i = 0; i < num_extra; ++i) {
-    argv[9 + i] = (char*)compiler_args[i];
+    argv[10 + i] = (char*)compiler_args[i];
   }
-  argv[9 + num_extra] = NULL;
+  argv[10 + num_extra] = NULL;
 
   // source -> a file (in memory, or unlinked at once), which becomes the
   // compiler's stdin
@@ -1339,6 +1358,12 @@ static struct c_aot_compile_result c_aot_compile_tcc(const struct c_aot_compiler
       tcc->tcc_set_lib_path(state, compiler->value.tcc.support_dir);
     }
     bool output_set = tcc->tcc_set_output_type(state, C_AOT_TCC_OUTPUT_MEMORY) >= 0;
+    // as for a compiler program (see the top of this header)
+#ifdef _WIN32
+    tcc->tcc_define_symbol(state, "C_AOT_EXPORT", "__declspec(dllexport)");
+#else
+    tcc->tcc_define_symbol(state, "C_AOT_EXPORT", "");
+#endif
     // the candidate's configure function sets options on the state, as a
     // compiler program gets the candidate's args
     int configured = 0;
@@ -1651,31 +1676,42 @@ static char* c_aot_tcc_neighbors(const char* library_path) {
   return NULL;
 }
 
-// compiles something tiny with compiler, to know it works. appends why not to
-// text (indented) and returns false if it doesn't
-static bool c_aot_probe(const struct c_aot_compiler* compiler, struct c_aot_text* text) {
+// runs the test program (test_source, or the built-in one if NULL) with
+// compiler, to know it works: compiles and loads it, then calls c_aot_test,
+// which must return 0. appends why not to text (indented) and returns false if
+// it doesn't
+static bool c_aot_probe(const struct c_aot_compiler* compiler, const char* test_source, struct c_aot_text* text) {
   // stddef.h: tcc needs its support files (include/) for it
-#ifdef _WIN32
-  static const char probe[] = "#include <stddef.h>\n__declspec(dllexport) size_t c_aot_probe(void) { return 1; }\n";
-#else
-  static const char probe[] = "#include <stddef.h>\nsize_t c_aot_probe(void) { return 1; }\n";
-#endif
+  static const char builtin[] = "#include <stddef.h>\nC_AOT_EXPORT int c_aot_test(void) { return 0; }\n";
+  const char* source = test_source ? test_source : builtin;
+  size_t source_size = strlen(source);
   struct c_aot_compile_result result;
   if (compiler->type == C_AOT_COMPILER_TCC) {
-    result = c_aot_compile_tcc(compiler, probe, sizeof(probe) - 1);
+    result = c_aot_compile_tcc(compiler, source, source_size);
   } else {
-    result = c_aot_compile_exec(probe, sizeof(probe) - 1, compiler->value.executable.path, (const char* const*)compiler->value.executable.args);
+    result = c_aot_compile_exec(source, source_size, compiler->value.executable.path, (const char* const*)compiler->value.executable.args);
   }
-  bool ok = result.type == C_AOT_COMPILE_OK && c_aot_compile_symbol(&result, "c_aot_probe") != NULL;
-  if (!ok) {
-    const char* message = result.type == C_AOT_COMPILE_ERR && result.value.error_msg ? result.value.error_msg : "the test program compiled, but its symbol wasn't found\n";
-    c_aot_text_add(text, "failed to compile a test program: ");
+  bool ok = false;
+  if (result.type != C_AOT_COMPILE_OK) {
+    const char* message = result.value.error_msg ? result.value.error_msg : "out of memory\n";
+    c_aot_text_add(text, "failed to compile the test program: ");
     // indent the lines of the message
     for (const char* line = message; *line;) {
       const char* nl = strchr(line, '\n');
       size_t n = nl ? (size_t)(nl - line) : strlen(line);
       if (n) c_aot_text_add(text, "\n      %.*s", (int)n, line);
       line += n + (nl ? 1 : 0);
+    }
+  } else {
+    void* symbol = c_aot_compile_symbol(&result, "c_aot_test");
+    if (!symbol) {
+      c_aot_text_add(text, "the test program compiled, but has no c_aot_test function");
+    } else {
+      int (*test)(void);
+      memcpy(&test, &symbol, sizeof(test)); // object to function pointer, without a cast warning
+      int returned = test();
+      ok = returned == 0;
+      if (!ok) c_aot_text_add(text, "the test program's c_aot_test returned %d, not 0", returned);
     }
   }
   c_aot_compile_result_destroy(&result);
@@ -1782,8 +1818,9 @@ static inline void c_aot_resolve_result_destroy(struct c_aot_resolve_result* res
   result->value.error_msg = NULL;
 }
 
-// tries the candidates in order and returns the first that works: an
-// executable that compiles a test program, or a libtcc that does. nothing is
+// tries the candidates in order and returns the first that works: one whose
+// test program (its test_source, or the built-in one) compiles, loads and
+// returns 0. nothing is
 // searched beyond the candidates (so "only tcc" is a list of one tcc library).
 // if none works, the result is an error that says why, for each.
 // resolving is not cheap (it compiles a test program), so do it once
@@ -1838,7 +1875,7 @@ static inline struct c_aot_resolve_result c_aot_compiler_resolve(const struct c_
       } else {
         tcc->support_dir = c_aot_tcc_neighbors(named);
         attempt.candidate = i;
-        if (c_aot_probe(&attempt, &report)) {
+        if (c_aot_probe(&attempt, c->test_source, &report)) {
           compiler = attempt;
           found = true;
           continue;
@@ -1876,7 +1913,7 @@ static inline struct c_aot_resolve_result c_aot_compiler_resolve(const struct c_
     attempt.candidate = i;
     if (!attempt.value.executable.path || !c_aot_copy_args(args, &attempt.value.executable.args)) {
       c_aot_text_add(&report, "out of memory");
-    } else if (c_aot_probe(&attempt, &report)) {
+    } else if (c_aot_probe(&attempt, c->test_source, &report)) {
       compiler = attempt;
       found = true;
       continue;

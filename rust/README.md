@@ -18,7 +18,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let compiler = Compiler::resolve_fast(None)?; // None: no libtcc
 
     // compile with it, as often as you like
-    let lib = compiler.compile("int add(int a, int b) { return a + b; }")?;
+    let lib = compiler.compile("C_AOT_EXPORT int add(int a, int b) { return a + b; }")?;
 
     // SAFETY: `add` really is `int add(int, int)`
     let add = unsafe { lib.get::<extern "C" fn(i32, i32) -> i32>(c"add") }.unwrap();
@@ -63,6 +63,46 @@ println!("{:?} won, candidate {}", compiler.kind(), compiler.candidate());
 
 `fast_candidates(tcc)` and `memory_first_candidates(tcc)` return a preset as a `Vec`, if you want to change it before
 resolving.
+
+### Your own test program
+
+Each candidate is tried with a test program: it is compiled, loaded, and its `int c_aot_test(void)` called, which must
+return 0 for the candidate to be accepted. `with_test` uses your own instead of the built-in one.
+
+Any other return value fails the candidate, and the report shows it. Mark `c_aot_test` with `C_AOT_EXPORT`, which
+every compile defines, so it is exported on Windows too.
+
+The test program is compiled the same way as your code, with the candidate's args, so it can prove that what those args
+enable really works on this machine. Here the args let your code use zlib, and the test checks that zlib's header is
+found, the library links and loads, and the define is set:
+
+```rust
+let gcc_with_zlib = Candidate::executable_with_args("gcc", ["-DUSE_ZLIB=1", "-lz"]).with_test(
+    "#include <zlib.h>
+C_AOT_EXPORT int c_aot_test(void) {
+  return USE_ZLIB == 1 && zlibVersion()[0] == ZLIB_VERSION[0] ? 0 : 1;
+}
+",
+);
+```
+
+Without zlib installed, or without `-lz`, this candidate fails and the next one is tried, so a candidate list can
+fall back from "with zlib" to "without".
+
+So resolving checks more than which compiler programs exist: it finds out which capabilities this machine has, such as a
+library, a header, an instruction set (`-mavx2`) or a compiler feature, each proven by its own test program. The defines
+on the winning candidate then reach every compile, so your generated code can pick up the same switches and use the
+best path available, with a plain fallback for the rest:
+
+```c
+#if USE_ZLIB
+    /* the fast path: zlib is there, and was proven to work */
+#else
+    /* the portable fallback */
+#endif
+```
+
+`compiler.candidate()` tells you which candidate won, if your program needs to know too.
 
 ### Configuring tcc
 

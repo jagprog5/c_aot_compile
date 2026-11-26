@@ -24,7 +24,7 @@ What it promises:
 
 1. **C text in, callable code out**, at the quality of the compiler that built it.
 2. **Finds the right compiler for you.** Say what you prefer, the fastest code or no writes to disk, and it works out
-   which compiler on this machine best gives you that: it tries the candidates in that order and test-compiles each,
+   which compiler on this machine best gives you that: it tries the candidates in that order and tests each one,
    so the one you get is known to work. Where there is no compiler, it falls back to a bundled libtcc if you ship one,
    or otherwise reports clearly what was tried.
 3. **Leaves nothing behind.** It keeps files in memory where the system allows, and removes temporary files otherwise.
@@ -41,7 +41,7 @@ Find a compiler once, then compile as often as you like. The same code works on 
 struct c_aot_resolve_result resolved = c_aot_compiler_resolve_fast(NULL);
 if (resolved.type == C_AOT_RESOLVE_ERR) { fputs(resolved.value.error_msg, stderr); return 1; }
 
-const char* src = "int add(int a, int b) { return a + b; }";
+const char* src = "C_AOT_EXPORT int add(int a, int b) { return a + b; }";
 struct c_aot_compile_result code = c_aot_compile(&resolved.value.compiler, src, strlen(src));
 if (code.type == C_AOT_COMPILE_ERR) { fputs(code.value.error_msg, stderr); return 1; }
 
@@ -57,10 +57,13 @@ c_aot_resolve_result_destroy(&resolved);
 use c_aot_compile::Compiler;
 
 let compiler = Compiler::resolve_fast(None)?;
-let lib = compiler.compile("int add(int a, int b) { return a + b; }")?;
+let lib = compiler.compile("C_AOT_EXPORT int add(int a, int b) { return a + b; }")?;
 let add = unsafe { lib.get::<extern "C" fn(i32, i32) -> i32>(c"add") }.unwrap();
 println!("{}", add(1, 2)); // 3
 ```
+
+`C_AOT_EXPORT` marks what you look up. Every compile defines it: as `__declspec(dllexport)` on Windows, where most
+toolchains only export what is marked, and as nothing elsewhere, so the same source works everywhere.
 
 The C and Rust READMEs have the full examples: [C](c/README.md), [Rust](rust/README.md).
 
@@ -71,9 +74,10 @@ compilers produce.
 
 ## Choosing the compiler
 
-A compiler is resolved once, from an ordered list of candidates. The first candidate that really works (it compiles a
-small test program) is the one you get. If none works, you get a single error that lists every candidate and why it
-failed:
+A compiler is resolved once, from an ordered list of candidates. The first candidate that really works is the one you
+get: it compiles, loads and runs a small test program, whose `int c_aot_test(void)` must return 0. A candidate can
+instead bring its own test program, to check what matters to you (a header, a flag, a feature). If none works, you get a
+single error that lists every candidate and why it failed:
 
 ```
 no working compiler. tried:

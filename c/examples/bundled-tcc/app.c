@@ -95,7 +95,7 @@ int main(int argc, char** argv) {
   }
 
   char source[4096];
-  snprintf(source, sizeof(source), "int f(int x) { return %s; }\n", argv[1]);
+  snprintf(source, sizeof(source), "C_AOT_EXPORT int f(int x) { return %s; }\n", argv[1]);
   struct c_aot_compile_result result = c_aot_compile(compiler, source, strlen(source));
   if (result.type == C_AOT_COMPILE_ERR) {
     fputs(result.value.error_msg, stderr);

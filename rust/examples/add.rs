@@ -5,7 +5,7 @@ fn main() {
 #ifndef MUST_BE_DEFINED
     #error arg pass failure
 #endif
-int add(int a, int b) { return a + b; }";
+C_AOT_EXPORT int add(int a, int b) { return a + b; }";
 
     // find a compiler once, and keep it. a compiler's args belong to its
     // candidate (-O2 overrides the default -O1). tcc takes a configure function

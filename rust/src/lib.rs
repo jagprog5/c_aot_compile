@@ -4,7 +4,9 @@
 //! compiler must have a gcc style driver (mingw gcc, clang, tcc), and symbols
 //! must be exported to be found: mingw exports every global symbol unless
 //! something is marked `__declspec(dllexport)`, other toolchains need it on
-//! whatever you look up.
+//! whatever you look up. Every compile defines `C_AOT_EXPORT`, which is that on
+//! Windows and nothing elsewhere: mark what you look up with it, and the same
+//! source works everywhere.
 //!
 //! Find a compiler once with [`Compiler::resolve`], from a list of
 //! [`Candidate`]s (an executable, given as a path or a name in `PATH`, an
@@ -12,7 +14,7 @@
 //!
 //! ```no_run
 //! let compiler = c_aot_compile::Compiler::resolve_memory_first(None)?; // $CC, cc, gcc, clang, ...
-//! let lib = compiler.compile("int add(int a, int b) { return a + b; }")?;
+//! let lib = compiler.compile("C_AOT_EXPORT int add(int a, int b) { return a + b; }")?;
 //! // SAFETY: `add` really is `int add(int, int)`.
 //! let add = unsafe { lib.get::<extern "C" fn(i32, i32) -> i32>(c"add") }.unwrap();
 //! assert_eq!(add(1, 2), 3); // `add` borrows `lib`, so it can't outlive it
@@ -55,7 +57,7 @@
 //! ```compile_fail,E0597
 //! let add = {
 //!     let compiler = c_aot_compile::Compiler::resolve_memory_first(None).unwrap();
-//!     let lib = compiler.compile("int f(void) { return 1; }").unwrap();
+//!     let lib = compiler.compile("C_AOT_EXPORT int f(void) { return 1; }").unwrap();
 //!     unsafe { lib.get::<extern "C" fn() -> i32>(c"f") }.unwrap()
 //! }; // error: `lib` dropped here while still borrowed
 //! add();
@@ -79,7 +81,7 @@
 //!   `fork` + custom code in a possibly threaded process.
 //!
 //! The compiler is run as
-//! `<compiler> -pipe -fPIC -shared -O1 -xc -o <library> - <args>`
+//! `<compiler> -pipe -fPIC -shared -O1 -DC_AOT_EXPORT=... -xc -o <library> - <args>`
 //! (no `-fPIC` on Windows), where `args` are the candidate's. They come last, so
 //! a later `-O2` or `-O0` overrides the `-O1`.
 //!
@@ -293,6 +295,8 @@ mod sys {
     pub const SYSTEM_COMPILERS: &[&str] = &["cc", "gcc", "clang"];
     pub const LIB_NAME: &str = "lib.so";
     pub const EXTRA_FLAGS: &[&str] = &["-fPIC"];
+    /// what `C_AOT_EXPORT` is defined as, in every compile
+    pub const EXPORT: &str = "";
     pub const KEEP_DIR_WHILE_LOADED: bool = false;
 
     pub fn temp_dir() -> Result<TempDir, Error> {
@@ -398,6 +402,8 @@ mod sys {
     pub const SYSTEM_COMPILERS: &[&str] = &["gcc", "clang", "cc"];
     pub const LIB_NAME: &str = "lib.dll";
     pub const EXTRA_FLAGS: &[&str] = &[];
+    /// what `C_AOT_EXPORT` is defined as, in every compile
+    pub const EXPORT: &str = "__declspec(dllexport)";
     pub const KEEP_DIR_WHILE_LOADED: bool = true;
 
     pub fn temp_dir() -> Result<TempDir, Error> {
@@ -497,12 +503,13 @@ pub enum Candidate {
     /// is a path (a relative one is relative to the current directory), else
     /// it is a name looked up in `PATH`. `program` must be a program only, no
     /// arguments: those are `args`, extra compiler arguments that come after
-    /// the fixed ones (`-pipe -fPIC -shared -O1 -xc -o <library> -`), so a
-    /// later `-O2` overrides the `-O1`.
-    Executable { program: PathBuf, args: Vec<String> },
+    /// the fixed ones (`-pipe -fPIC -shared -O1 -DC_AOT_EXPORT=... -xc -o
+    /// <library> -`), so a
+    /// later `-O2` overrides the `-O1`. `test`: see [`Candidate::with_test`].
+    Executable { program: PathBuf, args: Vec<String>, test: Option<String> },
     /// The name of an environment variable (like `CC`), whose value is an
     /// executable as above, with its own `args`. Not set or empty: skipped.
-    Env { variable: String, args: Vec<String> },
+    Env { variable: String, args: Vec<String>, test: Option<String> },
     /// A libtcc shared object. Either a path (it has a directory separator:
     /// used as given, and tcc's support files are looked for next to it) or a
     /// bare name (searched for by the system loader, like `dlopen` /
@@ -516,10 +523,11 @@ pub enum Candidate {
     ///
     /// A tcc library has no args: `configure` sets options on the tcc state
     /// directly instead. Every compile gets a fresh tcc state, so it runs
-    /// before every compile, not once.
+    /// before every compile, not once. `test`: see [`Candidate::with_test`].
     TccLibrary {
         library: PathBuf,
         configure: Option<TccConfigure>,
+        test: Option<String>,
     },
 }
 
@@ -527,18 +535,18 @@ impl Candidate {
     /// An executable (a path, or a name looked up in `PATH`), with no extra
     /// args.
     pub fn executable(program: impl Into<PathBuf>) -> Candidate {
-        Candidate::Executable { program: program.into(), args: Vec::new() }
+        Candidate::Executable { program: program.into(), args: Vec::new(), test: None }
     }
 
     /// An executable with extra compiler args, which come after the fixed ones.
     pub fn executable_with_args(program: impl Into<PathBuf>, args: impl IntoIterator<Item = impl Into<String>>) -> Candidate {
-        Candidate::Executable { program: program.into(), args: args.into_iter().map(Into::into).collect() }
+        Candidate::Executable { program: program.into(), args: args.into_iter().map(Into::into).collect(), test: None }
     }
 
     /// A libtcc shared object (a path, or a bare name for the system loader),
     /// with no configure function.
     pub fn tcc_library(library: impl Into<PathBuf>) -> Candidate {
-        Candidate::TccLibrary { library: library.into(), configure: None }
+        Candidate::TccLibrary { library: library.into(), configure: None, test: None }
     }
 
     /// A libtcc shared object with a `configure` function, which sets options
@@ -549,18 +557,37 @@ impl Candidate {
         library: impl Into<PathBuf>,
         configure: impl Fn(&TccState<'_>) -> Result<(), String> + Send + Sync + 'static,
     ) -> Candidate {
-        Candidate::TccLibrary { library: library.into(), configure: Some(TccConfigure::new(configure)) }
+        Candidate::TccLibrary { library: library.into(), configure: Some(TccConfigure::new(configure)), test: None }
     }
 
     /// The executable named by an environment variable, with no extra args.
     pub fn env(variable: impl Into<String>) -> Candidate {
-        Candidate::Env { variable: variable.into(), args: Vec::new() }
+        Candidate::Env { variable: variable.into(), args: Vec::new(), test: None }
     }
 
     /// The executable named by an environment variable, with extra compiler
     /// args, which come after the fixed ones.
     pub fn env_with_args(variable: impl Into<String>, args: impl IntoIterator<Item = impl Into<String>>) -> Candidate {
-        Candidate::Env { variable: variable.into(), args: args.into_iter().map(Into::into).collect() }
+        Candidate::Env { variable: variable.into(), args: args.into_iter().map(Into::into).collect(), test: None }
+    }
+
+    /// Proves this candidate works with your own test program instead of the
+    /// built-in one. `source` is C that defines `C_AOT_EXPORT int
+    /// c_aot_test(void)`: resolving compiles it with the candidate, loads it
+    /// and calls `c_aot_test`, which must return 0 (ok) for the candidate to be
+    /// accepted. Anything else fails the candidate, and the value is reported.
+    /// `C_AOT_EXPORT`, which every compile defines, exports it on Windows too.
+    pub fn with_test(mut self, source: impl Into<String>) -> Candidate {
+        match &mut self {
+            Candidate::Executable { test, .. } | Candidate::Env { test, .. } | Candidate::TccLibrary { test, .. } => *test = Some(source.into()),
+        }
+        self
+    }
+
+    fn test(&self) -> Option<&str> {
+        match self {
+            Candidate::Executable { test, .. } | Candidate::Env { test, .. } | Candidate::TccLibrary { test, .. } => test.as_deref(),
+        }
     }
 
     fn describe(&self) -> String {
@@ -707,7 +734,7 @@ pub enum CompilerKind {
     Tcc,
 }
 
-/// A resolved compiler: it has been found and shown to compile a test program.
+/// A resolved compiler: it has been found and has passed its test.
 /// Cheap to clone and share between threads; compile with it as often as you
 /// like. A [`Library`] keeps what it needs alive, so it can outlive this.
 #[derive(Clone)]
@@ -723,15 +750,13 @@ enum Backend {
     Tcc(Arc<Tcc>),
 }
 
-const PROBE: &str = if cfg!(windows) {
-    "#include <stddef.h>\n__declspec(dllexport) size_t c_aot_probe(void) { return 1; }\n"
-} else {
-    "#include <stddef.h>\nsize_t c_aot_probe(void) { return 1; }\n"
-};
+// the built-in test program. stddef.h: tcc needs its support files (include/) for it
+const BUILTIN_TEST: &str = "#include <stddef.h>\nC_AOT_EXPORT int c_aot_test(void) { return 0; }\n";
 
 impl Compiler {
-    /// Tries the candidates in order and returns the first that works: an
-    /// executable that compiles a test program, or a libtcc that does. Nothing
+    /// Tries the candidates in order and returns the first that works: one
+    /// whose test program (its own, see [`Candidate::with_test`], or the
+    /// built-in one) compiles, loads and returns 0. Nothing
     /// is searched beyond the candidates, so "only tcc" is a list of one
     /// [`Candidate::TccLibrary`]. Resolving isn't cheap (it compiles a test
     /// program): do it once.
@@ -809,8 +834,8 @@ impl fmt::Debug for Compiler {
 /// Resolves one candidate, then proves it works.
 fn try_candidate(candidate: &Candidate, index: usize) -> Result<Compiler, String> {
     let backend = match candidate {
-        Candidate::Executable { program, args } => Backend::Executable { path: exe_from_value(program.as_os_str())?, args: args.clone() },
-        Candidate::Env { variable, args } => {
+        Candidate::Executable { program, args, .. } => Backend::Executable { path: exe_from_value(program.as_os_str())?, args: args.clone() },
+        Candidate::Env { variable, args, .. } => {
             let value = match std::env::var_os(variable) {
                 Some(v) if !v.is_empty() => v,
                 _ => return Err("not set".to_owned()),
@@ -818,17 +843,19 @@ fn try_candidate(candidate: &Candidate, index: usize) -> Result<Compiler, String
             let path = exe_from_value(&value).map_err(|why| format!("set to \"{}\": {why}", value.to_string_lossy()))?;
             Backend::Executable { path, args: args.clone() }
         }
-        Candidate::TccLibrary { library, configure } => Backend::Tcc(Arc::new(Tcc::load(library, configure.clone())?)),
+        Candidate::TccLibrary { library, configure, .. } => Backend::Tcc(Arc::new(Tcc::load(library, configure.clone())?)),
     };
     let compiler = Compiler { backend, candidate: index };
     let lib = compiler
-        .compile(PROBE)
-        .map_err(|e| format!("failed to compile a test program:\n{e}"))?;
-    // SAFETY: the probe defines `size_t c_aot_probe(void)`; it's only looked up.
-    if unsafe { lib.get::<extern "C" fn() -> usize>(c"c_aot_probe") }.is_none() {
-        return Err("the test program compiled, but its symbol wasn't found".to_owned());
+        .compile(candidate.test().unwrap_or(BUILTIN_TEST))
+        .map_err(|e| format!("failed to compile the test program:\n{e}"))?;
+    // SAFETY: the test program's contract: it defines `int c_aot_test(void)`.
+    let test = unsafe { lib.get::<extern "C" fn() -> c_int>(c"c_aot_test") }
+        .ok_or("the test program compiled, but has no c_aot_test function")?;
+    match test() {
+        0 => Ok(compiler),
+        returned => Err(format!("the test program's c_aot_test returned {returned}, not 0")),
     }
-    Ok(compiler)
 }
 
 #[cfg(windows)]
@@ -1143,6 +1170,9 @@ fn compile_tcc(tcc: &Arc<Tcc>, source: &str) -> Result<Library, Error> {
             if (api.set_output_type)(state_ptr, TCC_OUTPUT_MEMORY) < 0 {
                 return Err(Error::Tcc("tcc_set_output_type failed".to_owned()));
             }
+            // as for a compiler program
+            let export = CString::new(sys::EXPORT).expect("no NUL in it");
+            (api.define_symbol)(state_ptr, c"C_AOT_EXPORT".as_ptr(), export.as_ptr());
             // the candidate's configure function sets options on the state, as
             // a compiler program gets the candidate's args
             if let Some(configure) = &tcc.configure {
@@ -1309,7 +1339,9 @@ fn compile_executable(compiler: &Path, candidate_args: &[String], source: &str) 
 
     let mut command = Command::new(compiler);
     command
-        .args(["-pipe", "-shared", "-O1", "-xc"])
+        .args(["-pipe", "-shared", "-O1"])
+        .arg(format!("-DC_AOT_EXPORT={}", sys::EXPORT))
+        .arg("-xc")
         .args(sys::EXTRA_FLAGS)
         .arg("-o")
         .arg(&lib_arg)

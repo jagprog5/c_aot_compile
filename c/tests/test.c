@@ -11,12 +11,6 @@
 #include <stdio.h>
 #include <string.h>
 
-// windows toolchains other than mingw gcc only export what is marked
-#ifdef _WIN32
-#define EXPORT "__declspec(dllexport) "
-#else
-#define EXPORT ""
-#endif
 
 // the compiler under test, resolved once in main: C_AOT_TEST_COMPILER (a name
 // or path; skipped when unset or empty), else the memory first preset
@@ -83,8 +77,8 @@ static int count_entries(const char* dir) {
 
 static void test_no_alias(void) {
   // two libraries loaded at once must not alias each other
-  struct c_aot_compile_result a = compile(EXPORT "int f(void){return 1;}");
-  struct c_aot_compile_result b = compile(EXPORT "int f(void){return 2;}");
+  struct c_aot_compile_result a = compile("C_AOT_EXPORT int f(void){return 1;}");
+  struct c_aot_compile_result b = compile("C_AOT_EXPORT int f(void){return 2;}");
   assert(a.type == C_AOT_COMPILE_OK && b.type == C_AOT_COMPILE_OK);
   assert(call_f(&a) == 1);
   assert(call_f(&b) == 2);
@@ -102,8 +96,8 @@ static void test_reused_fd_number_does_not_alias(void) {
   struct c_aot_resolve_result resolved = c_aot_compiler_resolve(list, 1);
   assert(resolved.type == C_AOT_RESOLVE_OK);
   const struct c_aot_compiler* compiler = &resolved.value.compiler;
-  const char* a_src = EXPORT "int f(void){return 1;}";
-  const char* b_src = EXPORT "int f(void){return 2;}";
+  const char* a_src = "C_AOT_EXPORT int f(void){return 1;}";
+  const char* b_src = "C_AOT_EXPORT int f(void){return 2;}";
   struct c_aot_compile_result a = c_aot_compile(compiler, a_src, strlen(a_src));
   assert(a.type == C_AOT_COMPILE_OK && call_f(&a) == 1);
   c_aot_compile_result_destroy(&a);
@@ -248,7 +242,7 @@ static void test_candidate_args(void) {
   struct c_aot_candidate list[] = {c_aot_candidate_executable(script, candidate_args)};
   struct c_aot_resolve_result resolved = c_aot_compiler_resolve(list, 1);
   assert(resolved.type == C_AOT_RESOLVE_OK);
-  const char* src = EXPORT "int f(void){return FROM_CANDIDATE;}";
+  const char* src = "C_AOT_EXPORT int f(void){return FROM_CANDIDATE;}";
   struct c_aot_compile_result r = c_aot_compile(&resolved.value.compiler, src, strlen(src));
   assert(r.type == C_AOT_COMPILE_OK);
   assert(call_f(&r) == 1);
@@ -306,6 +300,39 @@ static void test_fast_candidates(void) {
   assert(r.type == C_AOT_RESOLVE_OK);
   assert(r.value.compiler.type == C_AOT_COMPILER_EXECUTABLE);
   c_aot_resolve_result_destroy(&r);
+}
+
+// a candidate's own test program: accepted only if its c_aot_test returns 0
+static void test_candidate_test_program(void) {
+  const char* exe = g_compiler->value.executable.path;
+  struct c_aot_candidate pass = c_aot_candidate_executable(exe, NULL);
+  pass.test_source = "C_AOT_EXPORT int c_aot_test(void) { return sizeof(long) >= 4 ? 0 : 1; }";
+  struct c_aot_candidate refuses = c_aot_candidate_executable(exe, NULL);
+  refuses.test_source = "C_AOT_EXPORT int c_aot_test(void) { return 7; }";
+  struct c_aot_candidate missing = c_aot_candidate_executable(exe, NULL);
+  missing.test_source = "C_AOT_EXPORT int something_else(void) { return 0; }";
+  struct c_aot_candidate broken = c_aot_candidate_executable(exe, NULL);
+  broken.test_source = "this is not C";
+
+  // the failing ones are tried and reported, the passing one wins
+  struct c_aot_candidate list[] = {refuses, missing, broken, pass};
+  struct c_aot_resolve_result r = c_aot_compiler_resolve(list, 4);
+  assert(r.type == C_AOT_RESOLVE_OK && r.value.compiler.candidate == 3);
+  c_aot_resolve_result_destroy(&r);
+
+  struct c_aot_resolve_result none = c_aot_compiler_resolve(list, 3);
+  assert(none.type == C_AOT_RESOLVE_ERR && none.value.error_msg);
+  assert(strstr(none.value.error_msg, "c_aot_test returned 7, not 0"));
+  assert(strstr(none.value.error_msg, "has no c_aot_test function"));
+  assert(strstr(none.value.error_msg, "failed to compile the test program"));
+  c_aot_resolve_result_destroy(&none);
+
+  // NULL (what the constructors set): the built-in test program
+  struct c_aot_candidate builtin[] = {c_aot_candidate_executable(exe, NULL)};
+  assert(builtin[0].test_source == NULL);
+  struct c_aot_resolve_result b = c_aot_compiler_resolve(builtin, 1);
+  assert(b.type == C_AOT_RESOLVE_OK);
+  c_aot_resolve_result_destroy(&b);
 }
 
 static void test_resolution_falls_through(void) {
@@ -430,13 +457,21 @@ static void test_tcc(void) {
   struct c_aot_resolve_result configured = c_aot_compiler_resolve(with_configure, 1);
   assert(configured.type == C_AOT_RESOLVE_OK);
   assert(log.calls == 1 && !log.state_was_null); // the test program
-  const char* sum = EXPORT "int f(void){return FROM_DEFINE * 10 + FROM_OPTIONS;}";
+  const char* sum = "C_AOT_EXPORT int f(void){return FROM_DEFINE * 10 + FROM_OPTIONS;}";
   struct c_aot_compile_result sum_result = c_aot_compile(&configured.value.compiler, sum, strlen(sum));
   assert(sum_result.type == C_AOT_COMPILE_OK);
   assert(log.calls == 2 && log.has_set_options);
   assert(call_f(&sum_result) == 45);
   c_aot_compile_result_destroy(&sum_result);
   c_aot_resolve_result_destroy(&configured);
+
+  // a test program of your own sees what the configure function set
+  struct configure_log seen = {0, false, false};
+  struct c_aot_candidate checks_define = c_aot_candidate_tcc_library(library, configure_defines, &seen);
+  checks_define.test_source = "C_AOT_EXPORT int c_aot_test(void) { return FROM_DEFINE == 4 ? 0 : 1; }";
+  struct c_aot_resolve_result checked = c_aot_compiler_resolve(&checks_define, 1);
+  assert(checked.type == C_AOT_RESOLVE_OK && seen.calls == 1);
+  c_aot_resolve_result_destroy(&checked);
 
   // a configure function that returns nonzero stops before the source is compiled: the
   // test program then fails, and so the candidate
@@ -480,7 +515,7 @@ static void test_tcc(void) {
   struct c_aot_candidate with_host[] = {c_aot_candidate_tcc_library(library, configure_host, &setup)};
   struct c_aot_resolve_result hosted = c_aot_compiler_resolve(with_host, 1);
   assert(hosted.type == C_AOT_RESOLVE_OK);
-  const char* calls_host = EXPORT "int host_double(int);\n" EXPORT "int f(void){return host_double(VALUE);}";
+  const char* calls_host = "C_AOT_EXPORT int host_double(int);\n" "C_AOT_EXPORT int f(void){return host_double(VALUE);}";
   struct c_aot_compile_result first = c_aot_compile(&hosted.value.compiler, calls_host, strlen(calls_host));
   assert(first.type == C_AOT_COMPILE_OK && call_f(&first) == 10);
   setup.value = 7;
@@ -539,8 +574,8 @@ static void test_dying_compiler_does_not_hang(void) {
 
 static void test_source_need_not_be_nul_terminated(void) {
   // only the first source_size bytes count: here the rest would be a syntax error
-  const char* both = EXPORT "int f(void){return 5;}" "@@ not c @@";
-  size_t size = strlen(EXPORT "int f(void){return 5;}");
+  const char* both = "C_AOT_EXPORT int f(void){return 5;}" "@@ not c @@";
+  size_t size = strlen("C_AOT_EXPORT int f(void){return 5;}");
   struct c_aot_compile_result r = c_aot_compile(g_compiler, both, size);
   assert(r.type == C_AOT_COMPILE_OK);
   assert(call_f(&r) == 5);
@@ -553,7 +588,7 @@ static void test_extra_args(void) {
   struct c_aot_candidate list[] = {c_aot_candidate_executable(g_compiler->value.executable.path, args)};
   struct c_aot_resolve_result resolved = c_aot_compiler_resolve(list, 1);
   assert(resolved.type == C_AOT_RESOLVE_OK);
-  const char* src = EXPORT "int f(void){return VALUE;}\n" EXPORT "const char* g(void){return MSG;}";
+  const char* src = "C_AOT_EXPORT int f(void){return VALUE;}\n" "C_AOT_EXPORT const char* g(void){return MSG;}";
   struct c_aot_compile_result r = c_aot_compile(&resolved.value.compiler, src, strlen(src));
   assert(r.type == C_AOT_COMPILE_OK);
   assert(call_f(&r) == 7);
@@ -568,7 +603,7 @@ static void test_extra_args(void) {
 static void test_large_and_empty_source(void) {
   // large source (more than a pipe buffer holds)
   size_t pad = 4 << 20;
-  const char* body = EXPORT "int f(void){return 9;}\n";
+  const char* body = "C_AOT_EXPORT int f(void){return 9;}\n";
   size_t body_len = strlen(body);
   char* src = malloc(body_len + pad + 1);
   memcpy(src, body, body_len);
@@ -602,7 +637,7 @@ static void test_compiler_gets_the_right_tmpdir(void) {
 
   char* saved = getenv("TMPDIR") ? strdup(getenv("TMPDIR")) : NULL;
   struct c_aot_candidate list[] = {c_aot_candidate_executable(script, NULL)};
-  const char* src = EXPORT "int f(void){return 1;}";
+  const char* src = "C_AOT_EXPORT int f(void){return 1;}";
   char seen[512];
 
   for (int caller_sets_it = 0; caller_sets_it <= 1; ++caller_sets_it) {
@@ -673,7 +708,7 @@ static void test_temp_dir_cleanup(void) {
   assert(count_entries(dir) == 0);
 
   // a successful one leaves nothing once destroyed (on posix, not even while loaded)
-  struct c_aot_compile_result ok = compile(EXPORT "int f(void){return 1;}");
+  struct c_aot_compile_result ok = compile("C_AOT_EXPORT int f(void){return 1;}");
   assert(ok.type == C_AOT_COMPILE_OK);
 #ifndef _WIN32
   assert(count_entries(dir) == 0);
@@ -721,6 +756,7 @@ int main(void) {
   test_candidate_args();
 #endif
   test_resolution_falls_through();
+  test_candidate_test_program();
   test_tcc();
 #ifdef __linux__
   test_tcc_as_a_program();

@@ -29,8 +29,7 @@ fn temp_directory_is_removed_after_use() {
 
     // a successful one leaves nothing once unloaded (on unix, not even while
     // loaded)
-    let export = if cfg!(windows) { "__declspec(dllexport) " } else { "" };
-    let lib = compiler.compile(&format!("{export}int f(void){{return 1;}}")).unwrap();
+    let lib = compiler.compile("C_AOT_EXPORT int f(void){return 1;}").unwrap();
     if cfg!(unix) {
         assert_eq!(entries(), 0);
     }

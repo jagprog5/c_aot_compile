@@ -25,7 +25,7 @@ int main(void) {
     }
 
     // 2. compile with it, as often as you like
-    const char* src = "int add(int a, int b) { return a + b; }";
+    const char* src = "C_AOT_EXPORT int add(int a, int b) { return a + b; }";
     struct c_aot_compile_result code = c_aot_compile(&resolved.value.compiler, src, strlen(src));
     if (code.type == C_AOT_COMPILE_ERR) {
         fputs(code.value.error_msg, stderr); // the compiler's messages
@@ -77,6 +77,46 @@ struct c_aot_resolve_result resolved = c_aot_compiler_resolve(candidates, 4);
 `c_aot_fast_candidates(out, tcc)` and `c_aot_memory_first_candidates(out, tcc)` fill an array with a preset, if you
 want to change it before resolving. Give the array room for `C_AOT_PRESET_CANDIDATES_MAX` entries.
 
+### Your own test program
+
+Each candidate is tried with a test program: it is compiled, loaded, and its `int c_aot_test(void)` called, which must
+return 0 for the candidate to be accepted. Set `test_source` to use your own instead of the built-in one (`NULL`).
+
+Any other return value fails the candidate, and the report shows it. Mark `c_aot_test` with `C_AOT_EXPORT`, which
+every compile defines, so it is exported on Windows too.
+
+The test program is compiled the same way as your code, with the candidate's args, so it can prove that what those args
+enable really works on this machine. Here the args let your code use zlib, and the test checks that zlib's header is
+found, the library links and loads, and the define is set:
+
+```c
+const char* const zlib_args[] = {"-DUSE_ZLIB=1", "-lz", NULL};
+struct c_aot_candidate gcc_with_zlib = c_aot_candidate_executable("gcc", zlib_args);
+gcc_with_zlib.test_source =
+    "#include <zlib.h>\n"
+    "C_AOT_EXPORT int c_aot_test(void) {\n"
+    "  return USE_ZLIB == 1 && zlibVersion()[0] == ZLIB_VERSION[0] ? 0 : 1;\n"
+    "}\n";
+```
+
+Without zlib installed, or without `-lz`, this candidate fails and the next one is tried, so a candidate list can
+fall back from "with zlib" to "without".
+
+So resolving checks more than which compiler programs exist: it finds out which capabilities this machine has, such as a
+library, a header, an instruction set (`-mavx2`) or a compiler feature, each proven by its own test program. The defines
+on the winning candidate then reach every compile, so your generated code can pick up the same switches and use the
+best path available, with a plain fallback for the rest:
+
+```c
+#if USE_ZLIB
+    /* the fast path: zlib is there, and was proven to work */
+#else
+    /* the portable fallback */
+#endif
+```
+
+`resolved.value.compiler.candidate` tells you which candidate won, if your program needs to know too.
+
 ### Configuring tcc
 
 A tcc library has no args. It takes a function instead, which sets up the tcc state directly with libtcc's own
@@ -97,18 +137,18 @@ as the compiler is in use. Some of libtcc's functions may be missing in an older
 
 ## Reference
 
-| Function                                                     | What it does                                                                 |
-| ------------------------------------------------------------ | ---------------------------------------------------------------------------- |
-| `c_aot_compiler_resolve_fast(tcc)`                           | resolve with the fast preset. `tcc`: a libtcc path, or `NULL`                |
-| `c_aot_compiler_resolve_memory_first(tcc)`                   | resolve with the memory first preset                                         |
-| `c_aot_compiler_resolve(candidates, count)`                  | resolve with your own list                                                   |
-| `c_aot_resolve_result_destroy(&resolved)`                    | free the compiler, or the error message                                      |
-| `c_aot_compile(compiler, source, size)`                      | compile `source[0, size)` (need not end in a NUL) and load it                |
-| `c_aot_compile_symbol(&code, name)`                          | look up a symbol, or `NULL`. Valid until the code is destroyed               |
-| `c_aot_compile_result_destroy(&code)`                        | unload the code, or free the error message                                   |
-| `c_aot_candidate_executable(path_or_name, args)`             | a candidate program, with optional extra args (NULL terminated, or `NULL`)   |
-| `c_aot_candidate_env(variable, args)`                        | a candidate named by an environment variable                                 |
-| `c_aot_candidate_tcc_library(path_or_name, configure, data)` | a candidate libtcc, with an optional configure function                      |
+| Function                                                     | What it does                                                               |
+| ------------------------------------------------------------ | -------------------------------------------------------------------------- |
+| `c_aot_compiler_resolve_fast(tcc)`                           | resolve with the fast preset. `tcc`: a libtcc path, or `NULL`              |
+| `c_aot_compiler_resolve_memory_first(tcc)`                   | resolve with the memory first preset                                       |
+| `c_aot_compiler_resolve(candidates, count)`                  | resolve with your own list                                                 |
+| `c_aot_resolve_result_destroy(&resolved)`                    | free the compiler, or the error message                                    |
+| `c_aot_compile(compiler, source, size)`                      | compile `source[0, size)` (need not end in a NUL) and load it              |
+| `c_aot_compile_symbol(&code, name)`                          | look up a symbol, or `NULL`. Valid until the code is destroyed             |
+| `c_aot_compile_result_destroy(&code)`                        | unload the code, or free the error message                                 |
+| `c_aot_candidate_executable(path_or_name, args)`             | a candidate program, with optional extra args (NULL terminated, or `NULL`) |
+| `c_aot_candidate_env(variable, args)`                        | a candidate named by an environment variable                               |
+| `c_aot_candidate_tcc_library(path_or_name, configure, data)` | a candidate libtcc, with an optional configure function                    |
 
 Results are tagged unions: check `.type`, then read `.value`. A resolved compiler can be used from several threads.
 It must outlive every compile result made with it, so destroy the code before the compiler.

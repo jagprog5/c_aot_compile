@@ -1,11 +1,7 @@
 use c_aot_compile::{memory_first_candidates, Candidate, Compiler, CompilerKind, Error, Library};
 
-// windows toolchains other than mingw gcc only export what is marked
-const EXPORT: &str = if cfg!(windows) {
-    "__declspec(dllexport) "
-} else {
-    ""
-};
+// what the compiled code must export: C_AOT_EXPORT, which every compile defines
+const EXPORT: &str = "C_AOT_EXPORT ";
 
 /// The compiler under test, resolved once: `C_AOT_TEST_COMPILER` (a name or
 /// path; skipped when unset or empty), else the memory first preset's
@@ -337,12 +333,12 @@ fn fast_candidates_try_fast_args_then_plain_and_put_tcc_last() {
     assert_eq!(list.last(), Some(&Candidate::executable("tcc")), "last, everywhere: it doesn't optimize");
     for pair in list[..list.len() - 1].chunks(2) {
         match (&pair[0], &pair[1]) {
-            (Candidate::Executable { program: a, args: fast }, Candidate::Executable { program: b, args: plain }) => {
+            (Candidate::Executable { program: a, args: fast, .. }, Candidate::Executable { program: b, args: plain, .. }) => {
                 assert_eq!(a, b);
                 assert_eq!(fast, FAST_ARGS);
                 assert!(plain.is_empty());
             }
-            (Candidate::Env { variable: a, args: fast }, Candidate::Env { variable: b, args: plain }) => {
+            (Candidate::Env { variable: a, args: fast, .. }, Candidate::Env { variable: b, args: plain, .. }) => {
                 assert_eq!((a, b), (&"CC".to_owned(), &"CC".to_owned()));
                 assert_eq!(fast, FAST_ARGS);
                 assert!(plain.is_empty());
@@ -414,6 +410,26 @@ mod candidate_args {
 }
 
 #[test]
+fn a_candidates_own_test_program_must_return_0() {
+    let exe = compiler().path().to_path_buf();
+    let with = |source: &str| Candidate::executable(&exe).with_test(source);
+    let refuses = with("C_AOT_EXPORT int c_aot_test(void) { return 7; }");
+    let missing = with("C_AOT_EXPORT int something_else(void) { return 0; }");
+    let broken = with("this is not C");
+    let pass = with("C_AOT_EXPORT int c_aot_test(void) { return sizeof(long) >= 4 ? 0 : 1; }");
+
+    // the failing ones are tried and reported, the passing one wins
+    let list = [refuses, missing, broken, pass];
+    assert_eq!(Compiler::resolve(&list).unwrap_or_else(|e| panic!("{e}")).candidate(), 3);
+    let err = Compiler::resolve(&list[..3]).unwrap_err().to_string();
+    for expected in ["c_aot_test returned 7, not 0", "has no c_aot_test function", "failed to compile the test program"] {
+        assert!(err.contains(expected), "{expected} in:\n{err}");
+    }
+    // without one, the built-in test program
+    Compiler::resolve(&[Candidate::executable(&exe)]).unwrap_or_else(|e| panic!("{e}"));
+}
+
+#[test]
 fn tcc_configure_sets_options_on_the_state_directly() {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -432,6 +448,8 @@ fn tcc_configure_sets_options_on_the_state_directly() {
         }
         Ok(())
     });
+    // a test program of your own sees what the configure function set
+    let candidate = candidate.with_test("C_AOT_EXPORT int c_aot_test(void) { return FROM_DEFINE == 4 ? 0 : 1; }");
     let compiler = Compiler::resolve(&[candidate]).unwrap_or_else(|e| panic!("{e}"));
     assert_eq!(calls.load(Ordering::SeqCst), 1, "the test program");
     let lib = compiler
@@ -460,7 +478,7 @@ fn candidates_compare_and_clone() {
     assert_ne!(with, Candidate::tcc_library_with("/x/libtcc.so", |_| Ok(())), "another function is another candidate");
     assert_eq!(
         Candidate::executable_with_args("gcc", ["-O2"]),
-        Candidate::Executable { program: "gcc".into(), args: vec!["-O2".to_owned()] }
+        Candidate::Executable { program: "gcc".into(), args: vec!["-O2".to_owned()], test: None }
     );
 }
 
